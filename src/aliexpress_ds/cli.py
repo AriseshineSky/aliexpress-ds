@@ -69,6 +69,84 @@ def _auth_fatal(message: str) -> bool:
     return any(n in msg for n in needles)
 
 
+# Everymarket quality gates (same defaults as em-tasks prepare_upload --quality-filter).
+DEFAULT_MAX_PRICE = 100.0
+DEFAULT_MIN_RATING = 4.4
+DEFAULT_MIN_REVIEWS = 1000
+DEFAULT_MIN_SOLD_COUNT = 1000
+
+
+def _as_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(float(str(value).replace(",", "").strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def product_meets_quality(
+    product: dict,
+    *,
+    max_price: float = DEFAULT_MAX_PRICE,
+    min_rating: float = DEFAULT_MIN_RATING,
+    min_reviews: int = DEFAULT_MIN_REVIEWS,
+    min_sold_count: int = DEFAULT_MIN_SOLD_COUNT,
+) -> bool:
+    price = _as_float(product.get("price"))
+    rating = _as_float(product.get("rating"))
+    reviews = _as_int(product.get("reviews"))
+    sold = _as_int(product.get("sold_count"))
+    if price is None or price >= max_price:
+        return False
+    if rating is None or rating < min_rating:
+        return False
+    if reviews is None or reviews < min_reviews:
+        return False
+    if sold is None or sold < min_sold_count:
+        return False
+    return True
+
+
+def _load_pending_from_urls_file(path: Path) -> list[dict]:
+    """Load product_id/url rows from JSONL (e.g. quality_priority_urls.jsonl)."""
+    rows: list[dict] = []
+    seen: set[str] = set()
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            pid = str(obj.get("product_id") or "").strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            url = str(obj.get("url") or "").strip() or f"https://www.aliexpress.us/item/{pid}.html"
+            rows.append(
+                {
+                    "product_id": pid,
+                    "url": url,
+                    "source": obj.get("source") or "aliexpress.us",
+                    "title": obj.get("title"),
+                    "category": obj.get("category"),
+                }
+            )
+    return rows
+
+
 def _write_product_row(
     *,
     summary,
@@ -520,6 +598,26 @@ def fetch_es(
         "--index-es/--no-index-es",
         help="Upsert StandardProduct into ES_PRODUCTS_INDEX after each successful fetch",
     ),
+    urls_file: Optional[Path] = typer.Option(
+        None,
+        "--urls-file",
+        help="Fetch only these URLs (JSONL with product_id/url); skip ES pending scan",
+    ),
+    quality_filter: bool = typer.Option(
+        False,
+        "--quality-filter/--no-quality-filter",
+        help=(
+            "Also write rows that pass Everymarket quality gates "
+            f"(price<{DEFAULT_MAX_PRICE}, rating>={DEFAULT_MIN_RATING}, "
+            f"reviews>={DEFAULT_MIN_REVIEWS}, sold>={DEFAULT_MIN_SOLD_COUNT}) "
+            "to --quality-output"
+        ),
+    ),
+    quality_output: Path = typer.Option(
+        Path("data/ds_products_quality.jsonl"),
+        "--quality-output",
+        help="Append quality-passing products here when --quality-filter is set",
+    ),
 ) -> None:
     """Fetch products missing from products index → JSONL (raw + StandardProduct)."""
     from aliexpress_ds.rate_limit import RateLimiter
@@ -559,130 +657,172 @@ def fetch_es(
     existing = load_existing_product_ids(es, settings.es_products_index)
     console.print(f"Already in products index: {len(existing)}")
     console.print(f"Already in output JSONL:   {len(done)}")
-    console.print("Scanning URLs index for pending (materialize before API) …")
-    pending = list(
-        iter_missing_urls(
-            es,
-            urls_index=settings.es_urls_index,
-            products_index=settings.es_products_index,
-            existing_ids=existing,
+    if urls_file is not None:
+        if not urls_file.exists():
+            err_console.print(f"[red]urls file not found:[/red] {urls_file}")
+            raise typer.Exit(code=1)
+        pending = [
+            item
+            for item in _load_pending_from_urls_file(urls_file)
+            if item["product_id"] not in existing and item["product_id"] not in done
+        ]
+        console.print(f"From {urls_file}: pending={len(pending)} (excl. ES+JSONL done)")
+    else:
+        console.print("Scanning URLs index for pending (materialize before API) …")
+        pending = list(
+            iter_missing_urls(
+                es,
+                urls_index=settings.es_urls_index,
+                products_index=settings.es_products_index,
+                existing_ids=existing,
+            )
         )
-    )
-    console.print(f"Pending vs products index: {len(pending)}")
+        console.print(f"Pending vs products index: {len(pending)}")
+
+    if quality_filter:
+        quality_output.parent.mkdir(parents=True, exist_ok=True)
+        console.print(
+            f"Quality filter ON → {quality_output} "
+            f"(price<{DEFAULT_MAX_PRICE} rating≥{DEFAULT_MIN_RATING} "
+            f"reviews≥{DEFAULT_MIN_REVIEWS} sold≥{DEFAULT_MIN_SOLD_COUNT})"
+        )
 
     service = None if dry_run else ProductService()
     fetched = 0
     skipped = 0
     errors = 0
     es_indexed = 0
+    quality_kept = 0
 
-    with output.open("a", encoding="utf-8") as fh:
-        for item in pending:
-            pid = item["product_id"]
-            if pid in done:
-                skipped += 1
-                continue
+    quality_fh = (
+        quality_output.open("a", encoding="utf-8") if quality_filter and not dry_run else None
+    )
+    try:
+        with output.open("a", encoding="utf-8") as fh:
+            for item in pending:
+                pid = item["product_id"]
+                if pid in done:
+                    skipped += 1
+                    continue
 
-            if dry_run:
-                row = {
-                    "ok": True,
-                    "dry_run": True,
-                    "product_id": pid,
-                    "url": item["url"],
-                    "source": item.get("source"),
-                    "title": item.get("title"),
-                    "category": item.get("category"),
-                    "fetched_at": datetime.now(timezone.utc).isoformat(),
-                }
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-                fetched += 1
-            else:
-                assert service is not None and limiter is not None
-                success = False
-                stop_all = False
-                while not success:
-                    try:
-                        limiter.wait_turn()
-                    except RuntimeError as exc:
-                        err_console.print(f"[yellow]{exc}[/yellow]")
-                        stop_all = True
-                        break
-
-                    try:
-                        summary = service.get_by_url(
-                            item["url"],
-                            ship_to_country=country,
-                            target_currency=currency,
-                            target_language=language,
-                            local_country=country,
-                            local_language=language.lower(),
-                        )
-                        row = _write_product_row(
-                            summary=summary,
-                            item=item,
-                            include_raw=include_raw,
-                        )
-                        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-                        fh.flush()
-                        fetched += 1
-                        done.add(pid)
-                        success = True
-                        if index_es and isinstance(row.get("product"), dict):
-                            try:
-                                es_indexed += upsert_standard_products(
-                                    es,
-                                    settings.es_products_index,
-                                    [row["product"]],
-                                )
-                            except Exception as es_exc:
-                                err_console.print(
-                                    f"[yellow]ES upsert failed {pid}:[/yellow] {es_exc}"
-                                )
-                        if fetched % 20 == 0:
-                            console.print(
-                                f"… fetched {fetched} es={es_indexed} "
-                                f"remaining_today≈{limiter.remaining_today}"
-                            )
-                    except (ValueError, IopError, Exception) as exc:
-                        limited, cool = _is_rate_limited(exc)
-                        if limited:
-                            err_console.print(
-                                f"[yellow]Rate limited[/yellow] {exc}; cooling {cool:.0f}s"
-                            )
-                            limiter.penalize(cool)
-                            continue
-
-                        errors += 1
-                        row = {
-                            "ok": False,
-                            "product_id": pid,
-                            "url": item["url"],
-                            "error": str(exc),
-                            "fetched_at": datetime.now(timezone.utc).isoformat(),
-                        }
-                        if isinstance(exc, IopError) and exc.body is not None:
-                            row["error_body"] = exc.body
-                            row["raw"] = exc.body
-                        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-                        fh.flush()
-                        err_console.print(f"[red]{pid}[/red] {exc}")
-                        if _auth_fatal(str(exc)):
-                            err_console.print(
-                                "[yellow]Stopping early due to auth/sign error.[/yellow]"
-                            )
+                if dry_run:
+                    row = {
+                        "ok": True,
+                        "dry_run": True,
+                        "product_id": pid,
+                        "url": item["url"],
+                        "source": item.get("source"),
+                        "title": item.get("title"),
+                        "category": item.get("category"),
+                        "fetched_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    fetched += 1
+                else:
+                    assert service is not None and limiter is not None
+                    success = False
+                    stop_all = False
+                    while not success:
+                        try:
+                            limiter.wait_turn()
+                        except RuntimeError as exc:
+                            err_console.print(f"[yellow]{exc}[/yellow]")
                             stop_all = True
+                            break
+
+                        try:
+                            summary = service.get_by_url(
+                                item["url"],
+                                ship_to_country=country,
+                                target_currency=currency,
+                                target_language=language,
+                                local_country=country,
+                                local_language=language.lower(),
+                            )
+                            row = _write_product_row(
+                                summary=summary,
+                                item=item,
+                                include_raw=include_raw,
+                            )
+                            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                            fh.flush()
+                            fetched += 1
+                            done.add(pid)
+                            success = True
+                            product = row.get("product")
+                            if (
+                                quality_fh is not None
+                                and isinstance(product, dict)
+                                and product_meets_quality(product)
+                            ):
+                                quality_fh.write(
+                                    json.dumps(row, ensure_ascii=False) + "\n"
+                                )
+                                quality_fh.flush()
+                                quality_kept += 1
+                            if index_es and isinstance(product, dict):
+                                try:
+                                    es_indexed += upsert_standard_products(
+                                        es,
+                                        settings.es_products_index,
+                                        [product],
+                                    )
+                                except Exception as es_exc:
+                                    err_console.print(
+                                        f"[yellow]ES upsert failed {pid}:[/yellow] {es_exc}"
+                                    )
+                            if fetched % 20 == 0:
+                                console.print(
+                                    f"… fetched {fetched} es={es_indexed} "
+                                    f"quality={quality_kept} "
+                                    f"remaining_today≈{limiter.remaining_today}"
+                                )
+                        except (ValueError, IopError, Exception) as exc:
+                            limited, cool = _is_rate_limited(exc)
+                            if limited:
+                                err_console.print(
+                                    f"[yellow]Rate limited[/yellow] {exc}; cooling {cool:.0f}s"
+                                )
+                                limiter.penalize(cool)
+                                continue
+
+                            errors += 1
+                            row = {
+                                "ok": False,
+                                "product_id": pid,
+                                "url": item["url"],
+                                "error": str(exc),
+                                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            if isinstance(exc, IopError) and exc.body is not None:
+                                row["error_body"] = exc.body
+                                row["raw"] = exc.body
+                            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                            fh.flush()
+                            err_console.print(f"[red]{pid}[/red] {exc}")
+                            if _auth_fatal(str(exc)):
+                                err_console.print(
+                                    "[yellow]Stopping early due to auth/sign error.[/yellow]"
+                                )
+                                stop_all = True
+                            break
+
+                    if stop_all:
                         break
 
-                if stop_all:
+                if limit and fetched >= limit:
                     break
+    finally:
+        if quality_fh is not None:
+            quality_fh.close()
 
-            if limit and fetched >= limit:
-                break
-
-    console.print(
+    msg = (
         f"[green]Done[/green] wrote={fetched} es_indexed={es_indexed} "
         f"skipped_in_jsonl={skipped} errors={errors} → {output}"
     )
+    if quality_filter:
+        msg += f"  quality_kept={quality_kept} → {quality_output}"
+    console.print(msg)
 
 
 def main() -> None:

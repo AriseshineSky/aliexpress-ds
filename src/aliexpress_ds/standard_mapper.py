@@ -54,7 +54,14 @@ def _to_int(value: Any, default: int | None = None) -> int | None:
     try:
         if value is None or value == "":
             return default
-        return int(float(str(value).replace(",", "").strip()))
+        s = str(value).replace(",", "").strip()
+        # AE often returns floor buckets like "500+", "10000+"
+        if s.endswith("+"):
+            s = s[:-1].strip()
+        m = re.match(r"^-?\d+(?:\.\d+)?", s)
+        if m:
+            return int(float(m.group(0)))
+        return int(float(s))
     except (TypeError, ValueError):
         return default
 
