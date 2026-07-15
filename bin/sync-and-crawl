@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Sync DS category tree + crawl seeds to ES, then (optionally) start URL crawl.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DS="$ROOT"
+CRAWLER="$(cd "$ROOT/../aliexpress-link-crawler" && pwd)"
+
+echo "==> sync-categories (DS API → ES)"
+(cd "$DS" && uv run aliexpress-ds sync-categories \
+  --yaml-out "$CRAWLER/config/categories.priority.yaml")
+
+echo "==> verify crawler reads ES"
+(cd "$CRAWLER" && .venv/bin/python -c "from alilj import load_categories; c=load_categories(); print(f'{len(c)} categories')")
+
+if [[ "${1:-}" == "--crawl" ]]; then
+  echo "==> start link crawl"
+  (cd "$CRAWLER" && ./run_crawl.sh)
+else
+  echo "Done. Start crawl with: $0 --crawl"
+  echo "  or: cd $CRAWLER && ./run_crawl.sh"
+fi
