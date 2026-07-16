@@ -165,8 +165,8 @@ sudo systemctl list-timers 'aliexpress-ds*'
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `ALIEXPRESS_DAILY_LIMIT` | `5000` | 对齐 Test；上线后改成 Console 流量包（如 `100000`） |
-| `ALIEXPRESS_MIN_INTERVAL_SEC` | `0.5` | 主动约 ≤2 QPS；遇流控会自适应拉长间隔 |
+| `ALIEXPRESS_DAILY_LIMIT` | `5000` | 对齐 Test；上线后改成 Console 流量包（如 `400000`） |
+| `ALIEXPRESS_MIN_INTERVAL_SEC` | `0.5` | 主动 pacing；40万/天 ≈ `0.22`；遇流控会自适应拉长间隔 |
 | `ALIEXPRESS_MAX_RETRIES` | `6` | 每次 API：按 ban 秒数退避重试；传输错误指数退避 |
 
 `IopClient.execute` 统一：限速 → 发请求 → 解析流控 → 等待官方 ban 秒数 → 重试；日配额耗尽抛 `DailyQuotaExhausted` 并停工。
