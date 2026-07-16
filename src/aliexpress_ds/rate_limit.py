@@ -102,9 +102,11 @@ def parse_flow_control(exc: BaseException) -> FlowControl | None:
     """Return FlowControl if ``exc`` is an Open Platform rate/flow limit error."""
     blob = _exc_blob(exc)
     code = str(getattr(exc, "code", "") or "").strip()
+    code_l = code.lower()
 
     markers = (
         "apicalllimits",
+        "appapicalllimit",
         "app call limited",
         "call limited",
         "accesscontrol.limited",
@@ -112,10 +114,16 @@ def parse_flow_control(exc: BaseException) -> FlowControl | None:
         "limited-by-api",
         "ban will last",
         "flowlimit",
-        "frequency",
+        "frequency of app access",
         "api access frequency exceeds",
+        "frequency",
     )
-    code_hit = code in {"7", "ApiCallLimits", "App Call Limited"}
+    code_hit = code_l in {
+        "7",
+        "apicalllimits",
+        "app call limited",
+        "appapicalllimit",
+    }
     if not code_hit and not any(m in blob for m in markers):
         return None
 
@@ -128,17 +136,24 @@ def parse_flow_control(exc: BaseException) -> FlowControl | None:
             stop_for_day=True,
             sub_code="accesscontrol.limited-by-app-access-count",
         )
-    if "limited-by-app-api-access-count" in blob:
+    # App+API frequency (common Online): code AppApiCallLimit
+    # msg e.g. "The frequency of app access to the api exceeds the limit.
+    # This ban will last N seconds"
+    if (
+        code_l == "appapicalllimit"
+        or "limited-by-app-api-access-count" in blob
+        or "frequency of app access to the api" in blob
+    ):
         return FlowControl(
             FlowKind.APP_API,
             cooldown_sec=max(ban, 1.0),
-            sub_code="accesscontrol.limited-by-app-api-access-count",
+            sub_code=code or "AppApiCallLimit",
         )
     if "limited-by-api-access-count" in blob or "apicalllimits" in blob:
         return FlowControl(
             FlowKind.API_QPS,
             cooldown_sec=max(ban, 1.0),
-            sub_code="accesscontrol.limited-by-api-access-count",
+            sub_code=code or "accesscontrol.limited-by-api-access-count",
         )
     if "app call limited" in blob or code == "7":
         return FlowControl(
@@ -146,7 +161,7 @@ def parse_flow_control(exc: BaseException) -> FlowControl | None:
             cooldown_sec=max(ban, 60.0 if ban <= 1.0 else ban),
             sub_code=code or "7",
         )
-    return FlowControl(FlowKind.UNKNOWN, cooldown_sec=max(ban, 1.0))
+    return FlowControl(FlowKind.UNKNOWN, cooldown_sec=max(ban, 1.0), sub_code=code)
 
 
 class RateLimiter:
@@ -305,12 +320,30 @@ class RateLimiter:
                 self._cooldown_until = until
             bumped = max(self._effective_interval * 1.5, self.base_interval_sec * 2.0, 1.0)
             self._effective_interval = min(MAX_ADAPTIVE_INTERVAL_SEC, bumped)
+            # Hard App+API bans (minutes+) mean proactive pacing was too aggressive —
+            # raise the floor so we do not re-trigger immediately after the cool-down.
+            if cool >= 60.0 and fc.kind in {FlowKind.APP_API, FlowKind.API_QPS, FlowKind.UNKNOWN}:
+                new_base = min(
+                    MAX_ADAPTIVE_INTERVAL_SEC,
+                    max(self.base_interval_sec * 1.5, self.base_interval_sec + 0.1, 0.35),
+                )
+                if new_base > self.base_interval_sec:
+                    logger.warning(
+                        "Hard ban %.0fs — raising base interval %.2fs→%.2fs for this process",
+                        cool,
+                        self.base_interval_sec,
+                        new_base,
+                    )
+                    self.base_interval_sec = new_base
+                    self.min_interval_sec = new_base
+                    self._effective_interval = max(self._effective_interval, new_base)
             logger.warning(
-                "Flow control kind=%s sub=%s sleep=%.1fs interval→%.2fs",
+                "Flow control kind=%s sub=%s sleep=%.1fs interval→%.2fs base=%.2fs",
                 fc.kind.value,
                 fc.sub_code or "-",
                 cool,
                 self._effective_interval,
+                self.base_interval_sec,
             )
         return cool
 

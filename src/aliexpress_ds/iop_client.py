@@ -158,12 +158,14 @@ class IopClient:
                 if attempt >= attempts - 1:
                     raise
                 logger.warning(
-                    "IOP flow-control on %s attempt=%s/%s: %s — cooling %.1fs",
+                    "IOP flow-control on %s attempt=%s/%s: %s code=%s — cooling %.1fs — %s",
                     method,
                     attempt + 1,
                     attempts,
                     fc.kind.value,
+                    fc.sub_code or exc.code or "-",
                     fc.cooldown_sec,
+                    str(exc)[:200],
                 )
                 if self.limiter is not None:
                     self.limiter.apply_flow_control(fc)
@@ -223,12 +225,14 @@ class IopClient:
                 if attempt >= attempts - 1:
                     raise
                 logger.warning(
-                    "IOP flow-control on %s attempt=%s/%s: %s — cooling %.1fs",
+                    "IOP flow-control on %s attempt=%s/%s: %s code=%s — cooling %.1fs — %s",
                     method,
                     attempt + 1,
                     attempts,
                     fc.kind.value,
+                    fc.sub_code or exc.code or "-",
                     fc.cooldown_sec,
+                    str(exc)[:200],
                 )
                 if self.limiter is not None:
                     await self.limiter.apply_flow_control_async(fc)
