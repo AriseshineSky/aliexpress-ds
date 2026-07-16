@@ -1337,7 +1337,14 @@ def queue_worker(
 
         url = str(job.get("url") or "").strip() or f"https://www.aliexpress.us/item/{pid}.html"
         source = str(job.get("source") or "aliexpress.us").strip()
-        item = {"product_id": pid, "url": url, "source": source}
+        # Keep category from enqueue job — DS leaf category_id rarely maps in the
+        # 549-node tree, so urls-index breadcrumb is the main categories source.
+        item = {
+            "product_id": pid,
+            "url": url,
+            "source": source,
+            "category": job.get("category") or job.get("categories"),
+        }
 
         success = False
         stop_all = False
