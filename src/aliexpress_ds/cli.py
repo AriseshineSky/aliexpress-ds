@@ -411,7 +411,7 @@ def sync_categories(
         build_crawl_targets,
         flatten_category_tree,
     )
-    from aliexpress_ds.es import ensure_index, upsert_docs
+    from aliexpress_ds.es import ensure_index, upsert_crawl_category_seeds, upsert_docs
     from aliexpress_ds.iop_client import IopError
 
     settings = get_settings()
@@ -443,7 +443,7 @@ def sync_categories(
         tree_rows,
         id_field="category_id",
     )
-    n_crawl = upsert_docs(
+    n_crawl = upsert_crawl_category_seeds(
         es,
         settings.es_crawl_categories_index,
         crawl_rows,

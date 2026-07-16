@@ -277,6 +277,45 @@ def upsert_docs(
     return len(actions) // 2
 
 
+def upsert_crawl_category_seeds(
+    es: Elasticsearch,
+    index: str,
+    docs: list[dict[str, Any]],
+    *,
+    id_field: str = "name",
+) -> int:
+    """Partial-update crawl seeds; preserve claim/crawl progress fields.
+
+    New docs get crawl_status=pending. Existing docs keep crawl_status,
+    claimed_*, listing_total, crawled_* etc.
+    """
+    if not docs:
+        return 0
+    ok = 0
+    for doc in docs:
+        doc_id = str(doc.get(id_field) or "").strip()
+        if not doc_id:
+            continue
+        seed = dict(doc)
+        upsert = dict(seed)
+        upsert.setdefault("crawl_status", "pending")
+        try:
+            es.update(
+                index=index,
+                id=doc_id,
+                body={"doc": seed, "upsert": upsert},
+                refresh=False,
+            )
+            ok += 1
+        except Exception:
+            continue
+    try:
+        es.indices.refresh(index=index)
+    except Exception:
+        pass
+    return ok
+
+
 def ensure_index(es: Elasticsearch, index: str) -> None:
     if not es.indices.exists(index=index):
         es.indices.create(index=index)
