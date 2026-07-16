@@ -14,8 +14,15 @@ class Settings(BaseSettings):
     aliexpress_app_secret: str = ""
     aliexpress_access_token: str = ""
 
-    # Upstash / Redis — same key as aliexpress-oauth TokenStore
+    # Upstash / Redis — same key as aliexpress-oauth TokenStore (access_token only)
     redis_url: str = ""
+
+    # Task queue Redis (product_id jobs) — separate from OAuth REDIS_URL
+    # e.g. redis://:password@34.133.1.247:6379/0
+    redis_queue_url: str = ""
+    redis_queue_key: str = "aliexpress-ds:products"
+    redis_queue_seen_key: str = "aliexpress-ds:products:seen"
+    redis_queue_brpop_timeout: int = 5
 
     # IOP sync gateway (Dropshipping)
     aliexpress_api_url: str = "https://api-sg.aliexpress.com/sync"
@@ -36,6 +43,29 @@ class Settings(BaseSettings):
     # Also pace QPS to reduce ApiCallLimits / App Call Limited bans.
     aliexpress_daily_limit: int = 5000
     aliexpress_min_interval_sec: float = 1.0
+
+    # Quality gates for enqueue-es (from ES urls index listing fields).
+    # price must be < max; rating/reviews/sold_count must be >= mins.
+    # Set ENQUEUE_QUALITY_FILTER=0 to disable.
+    enqueue_quality_filter: bool = True
+    enqueue_max_price: float = 100.0
+    enqueue_min_rating: float = 4.4
+    enqueue_min_reviews: int = 1000
+    enqueue_min_sold_count: int = 1000
+
+    # Category blacklist for enqueue-es (skip clothing / adult products).
+    enqueue_category_blacklist: bool = True
+    enqueue_category_blacklist_file: str = ""  # default: config/category_blacklist.yaml
+
+    # Product enrich on fetch (freight.calculate + categories)
+    fetch_shipping_fee: bool = True
+
+    def require_queue_redis(self) -> None:
+        if not (self.redis_queue_url or "").strip():
+            raise ValueError(
+                "REDIS_QUEUE_URL missing in .env "
+                "(task queue, e.g. redis://:pw@34.133.1.247:6379/0)"
+            )
 
     def require_credentials(self) -> None:
         missing = []

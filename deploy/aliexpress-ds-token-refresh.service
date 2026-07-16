@@ -1,0 +1,16 @@
+[Unit]
+Description=AliExpress DS OAuth token refresh (Upstash REDIS_URL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=Admin
+Group=Admin
+WorkingDirectory=/home/Admin/aliexpress-ds
+Environment=HOME=/home/Admin
+Environment=PATH=/home/Admin/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/Admin/.local/bin/uv run aliexpress-ds refresh-token
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aliexpress-ds-token

@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly AliExpress DS OAuth token refresh
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Persistent=true
+Unit=aliexpress-ds-token-refresh.service
+
+[Install]
+WantedBy=timers.target

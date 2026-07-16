@@ -303,7 +303,15 @@ def to_standard_product(
         product_id = m.group(1) if m else "0"
 
     skus = _sku_list(result)
-    currency = str(base.get("currency_code") or (skus[0].get("currency_code") if skus else None) or "USD")
+    # SKU offer_sale_price is in sku.currency_code (buyer/local, e.g. USD when
+    # target_currency=USD). base.currency_code is often the seller/origin CNY.
+    sku_currency = None
+    for sku in skus:
+        code = str(sku.get("currency_code") or "").strip()
+        if code:
+            sku_currency = code
+            break
+    currency = sku_currency or str(base.get("currency_code") or "USD")
     options, variants, has_only_default, price, available_qty = _build_options_and_variants(
         product_id, currency, skus
     )

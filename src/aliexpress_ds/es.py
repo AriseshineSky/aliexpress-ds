@@ -25,8 +25,9 @@ def scroll_sources(
     source_fields: list[str],
     page_size: int = 2000,
     keep_alive: str = "10m",
+    query: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Scroll all docs. keep_alive must cover time to finish consuming each page.
+    """Scroll docs. keep_alive must cover time to finish consuming each page.
 
     Prefer materializing quickly (see ``list_missing_urls``) when callers pause
     between yields for slow API work — otherwise scroll context may expire.
@@ -36,7 +37,7 @@ def scroll_sources(
         size=page_size,
         scroll=keep_alive,
         _source=source_fields,
-        query={"match_all": {}},
+        query=query or {"match_all": {}},
     )
     scroll_id = resp.get("_scroll_id")
     try:
@@ -56,6 +57,26 @@ def scroll_sources(
                 es.clear_scroll(scroll_id=scroll_id)
             except Exception:
                 pass
+
+
+def urls_quality_query(
+    *,
+    max_price: float | None = None,
+    min_rating: float | None = None,
+    min_reviews: int | None = None,
+    min_sold_count: int | None = None,
+) -> dict[str, Any]:
+    """ES bool query for listing quality gates on the urls index."""
+    must: list[dict[str, Any]] = [{"exists": {"field": "product_id"}}]
+    if max_price is not None and max_price > 0:
+        must.append({"range": {"price": {"gt": 0, "lt": float(max_price)}}})
+    if min_rating is not None:
+        must.append({"range": {"rating": {"gte": float(min_rating)}}})
+    if min_reviews is not None:
+        must.append({"range": {"reviews": {"gte": int(min_reviews)}}})
+    if min_sold_count is not None:
+        must.append({"range": {"sold_count": {"gte": int(min_sold_count)}}})
+    return {"bool": {"must": must}}
 
 
 def load_existing_product_ids(es: Elasticsearch, products_index: str) -> set[str]:
@@ -79,15 +100,43 @@ def list_missing_urls(
     urls_index: str,
     products_index: str,
     existing_ids: set[str] | None = None,
+    max_price: float | None = None,
+    min_rating: float | None = None,
+    min_reviews: int | None = None,
+    min_sold_count: int | None = None,
+    quality_filter: bool = False,
 ) -> list[dict[str, Any]]:
-    """Load all pending URLs into memory so scroll finishes before slow API calls."""
+    """Load pending URLs into memory so scroll finishes before slow API calls.
+
+    When ``quality_filter`` is True, apply listing gates on urls-index fields
+    (price / rating / reviews / sold_count) via ES query.
+    """
     existing = existing_ids if existing_ids is not None else load_existing_product_ids(es, products_index)
+    query: dict[str, Any] | None = None
+    if quality_filter:
+        query = urls_quality_query(
+            max_price=max_price,
+            min_rating=min_rating,
+            min_reviews=min_reviews,
+            min_sold_count=min_sold_count,
+        )
     missing: list[dict[str, Any]] = []
     for doc in scroll_sources(
         es,
         urls_index,
-        source_fields=["product_id", "url", "source", "title", "category"],
+        source_fields=[
+            "product_id",
+            "url",
+            "source",
+            "title",
+            "category",
+            "price",
+            "rating",
+            "reviews",
+            "sold_count",
+        ],
         keep_alive="10m",
+        query=query,
     ):
         pid = str(doc.get("product_id") or "").strip()
         if not pid or pid in existing:
@@ -100,6 +149,10 @@ def list_missing_urls(
                 "source": doc.get("source"),
                 "title": doc.get("title"),
                 "category": doc.get("category"),
+                "price": doc.get("price"),
+                "rating": doc.get("rating"),
+                "reviews": doc.get("reviews"),
+                "sold_count": doc.get("sold_count"),
                 "es_id": doc.get("_id"),
             }
         )
@@ -112,12 +165,22 @@ def iter_missing_urls(
     urls_index: str,
     products_index: str,
     existing_ids: set[str] | None = None,
+    max_price: float | None = None,
+    min_rating: float | None = None,
+    min_reviews: int | None = None,
+    min_sold_count: int | None = None,
+    quality_filter: bool = False,
 ) -> Iterator[dict[str, Any]]:
     yield from list_missing_urls(
         es,
         urls_index=urls_index,
         products_index=products_index,
         existing_ids=existing_ids,
+        max_price=max_price,
+        min_rating=min_rating,
+        min_reviews=min_reviews,
+        min_sold_count=min_sold_count,
+        quality_filter=quality_filter,
     )
 
 

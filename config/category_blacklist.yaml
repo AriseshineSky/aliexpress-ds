@@ -1,0 +1,75 @@
+# Category blacklist for enqueue-es (urls index ``category`` field).
+# Matched with word/phrase boundaries (case-insensitive).
+# Override: ENQUEUE_CATEGORY_BLACKLIST_KEYWORDS=foo,bar in .env
+
+keywords:
+  # --- clothing / 服装 ---
+  - women's clothing
+  - men's clothing
+  - apparel
+  - clothing
+  - clothes
+  - dress
+  - dresses
+  - shirt
+  - shirts
+  - blouse
+  - skirt
+  - skirts
+  - jeans
+  - hoodie
+  - sweatshirt
+  - sweater
+  - jacket
+  - jackets
+  - coat
+  - coats
+  - underwear
+  - lingerie
+  - swimsuit
+  - swimwear
+  - bikini
+  - t-shirt
+  - tshirt
+  - tops &
+  - pants
+  - trousers
+  - shorts
+  - socks
+  - activewear
+  - sportswear
+  - 服装
+  # --- adult / 成人用品 ---
+  - novelty & special use
+  - novelty and special use
+  - adult novelty
+  - adult product
+  - adult products
+  - adult toy
+  - adult toys
+  - adult sex
+  - sex toy
+  - sex toys
+  - sex product
+  - sex products
+  - erotic
+  - erotica
+  - vibrator
+  - vibrators
+  - dildo
+  - dildos
+  - masturbator
+  - masturbation
+  - bdsm
+  - fetish
+  - bondage
+  - intimate toy
+  - intimate toys
+  - pleasure toy
+  - pleasure toys
+  - sexy lingerie
+  - adult entertainment
+  - 成人
+  - 情趣
+  - 性用品
+  - 成人用品

@@ -1,0 +1,29 @@
+[Unit]
+Description=AliExpress DS Redis queue worker (product detail + price → ES)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=Admin
+Group=Admin
+WorkingDirectory=/home/Admin/aliexpress-ds
+Environment=HOME=/home/Admin
+Environment=PATH=/home/Admin/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Credentials from WorkingDirectory/.env (pydantic-settings). Avoid EnvironmentFile —
+# Redis passwords may contain shell-special characters.
+ExecStartPre=-/home/Admin/.local/bin/uv run aliexpress-ds refresh-token
+ExecStart=/home/Admin/.local/bin/uv run aliexpress-ds queue-worker
+Restart=always
+RestartSec=15
+TimeoutStartSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aliexpress-ds-worker
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

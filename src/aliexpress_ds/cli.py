@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,6 +16,7 @@ from aliexpress_ds.es import (
     iter_missing_urls,
     load_existing_product_ids,
     make_es_client,
+    scroll_sources,
     upsert_standard_products,
     upsert_url_docs,
 )
@@ -152,7 +154,10 @@ def _write_product_row(
     summary,
     item: dict,
     include_raw: bool,
+    ship_to_country: str = "US",
+    fetch_shipping: bool = True,
 ) -> dict:
+    from aliexpress_ds.enrich import enrich_product
     from aliexpress_ds.standard_mapper import to_standard_product
 
     raw = summary.raw or {}
@@ -160,6 +165,13 @@ def _write_product_row(
         raw,
         url=item["url"],
         source=item.get("source") or item.get("es_source"),
+    )
+    product = enrich_product(
+        product,
+        raw_payload=raw,
+        item=item,
+        ship_to_country=ship_to_country,
+        fetch_shipping=fetch_shipping,
     )
     row = {
         "ok": True,
@@ -256,17 +268,74 @@ def config_check() -> None:
     settings = get_settings()
     try:
         settings.require_credentials()
-        from aliexpress_ds.token_store import resolve_access_token
+        from aliexpress_ds.token_store import (
+            access_token_expired,
+            ensure_fresh_token,
+            load_token_from_redis,
+            resolve_access_token,
+        )
 
         token = resolve_access_token(settings)
+        data = load_token_from_redis(settings)
     except ValueError as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
     console.print("[green]Credentials OK[/green]")
     console.print(f"app_key={settings.aliexpress_app_key}")
     console.print(f"api_url={settings.aliexpress_api_url}")
-    console.print(f"redis={'yes' if settings.redis_url else 'no'}")
+    console.print(f"oauth_redis={'yes' if settings.redis_url else 'no'}")
+    console.print(f"queue_redis={'yes' if settings.redis_queue_url else 'no'}")
     console.print(f"token=…{token[-6:]}")
+    if data:
+        console.print(f"expires_at={data.get('expires_at')}")
+        console.print(f"refresh_expires_at={data.get('refresh_expires_at')}")
+        console.print(f"access_expired_soon={access_token_expired(data)}")
+
+
+@app.command("refresh-token")
+def refresh_token_cmd(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Call /auth/token/refresh even if access_token is still valid",
+    ),
+) -> None:
+    """Ensure Upstash REDIS_URL token is fresh (auto-refresh when near expiry)."""
+    from aliexpress_ds.token_store import (
+        ensure_fresh_token,
+        load_token_from_redis,
+        refresh_access_token,
+        refresh_token_expired,
+    )
+
+    settings = get_settings()
+    try:
+        settings.require_credentials()
+        if not (settings.redis_url or "").strip():
+            raise ValueError("REDIS_URL missing (Upstash rediss://…)")
+        data = load_token_from_redis(settings)
+        if not data:
+            raise ValueError(
+                "No token in Redis. Open "
+                "https://aliexpress-oauth.onrender.com/oauth/authorize first."
+            )
+        if force:
+            rt = str(data.get("refresh_token") or "").strip()
+            if not rt:
+                raise ValueError("No refresh_token in Redis")
+            if refresh_token_expired(data):
+                raise ValueError("refresh_token expired — re-authorize")
+            data = refresh_access_token(rt, settings=settings, previous=data)
+        else:
+            data = ensure_fresh_token(settings)
+    except (ValueError, RuntimeError) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print("[green]Token OK[/green]")
+    console.print(f"access_token=…{(data.get('access_token') or '')[-6:]}")
+    console.print(f"expires_at={data.get('expires_at')}")
+    console.print(f"refresh_expires_at={data.get('refresh_expires_at')}")
 
 
 @app.command("feed-names")
@@ -739,10 +808,14 @@ def fetch_es(
                                 local_country=country,
                                 local_language=language.lower(),
                             )
+                            if settings.fetch_shipping_fee:
+                                limiter.wait_turn()
                             row = _write_product_row(
                                 summary=summary,
                                 item=item,
                                 include_raw=include_raw,
+                                ship_to_country=country,
+                                fetch_shipping=settings.fetch_shipping_fee,
                             )
                             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
                             fh.flush()
@@ -823,6 +896,546 @@ def fetch_es(
     if quality_filter:
         msg += f"  quality_kept={quality_kept} → {quality_output}"
     console.print(msg)
+
+
+@app.command("queue-status")
+def queue_status() -> None:
+    """Show Redis product task queue length / seen count."""
+    from aliexpress_ds.queue import get_product_queue
+
+    settings = get_settings()
+    try:
+        settings.require_queue_redis()
+        q = get_product_queue(settings)
+        q.ping()
+    except (ValueError, Exception) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"queue={settings.redis_queue_key} len={q.length()}")
+    console.print(f"seen={settings.redis_queue_seen_key} count={q.seen_count()}")
+
+
+@app.command("enqueue-es")
+def enqueue_es(
+    limit: int = typer.Option(0, "--limit", "-n", help="Max product_ids to enqueue (0 = all)"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Re-enqueue even if product_id is already in Redis seen set",
+    ),
+    skip_existing_products: bool = typer.Option(
+        True,
+        "--skip-existing/--include-existing",
+        help="Only enqueue ids missing from ES_PRODUCTS_INDEX (default)",
+    ),
+    quality_filter: bool | None = typer.Option(
+        None,
+        "--quality-filter/--no-quality-filter",
+        help=(
+            "Filter urls by price/rating/reviews/sold_count "
+            "(default: ENQUEUE_QUALITY_FILTER from .env)"
+        ),
+    ),
+    max_price: float | None = typer.Option(
+        None,
+        "--max-price",
+        help="price < this (default: ENQUEUE_MAX_PRICE)",
+    ),
+    min_rating: float | None = typer.Option(
+        None,
+        "--min-rating",
+        help="rating >= this (default: ENQUEUE_MIN_RATING)",
+    ),
+    min_reviews: int | None = typer.Option(
+        None,
+        "--min-reviews",
+        help="reviews >= this (default: ENQUEUE_MIN_REVIEWS)",
+    ),
+    min_sold_count: int | None = typer.Option(
+        None,
+        "--min-sold",
+        help="sold_count >= this (default: ENQUEUE_MIN_SOLD_COUNT)",
+    ),
+    category_blacklist: bool | None = typer.Option(
+        None,
+        "--category-blacklist/--no-category-blacklist",
+        help="Skip clothing/adult categories (default: ENQUEUE_CATEGORY_BLACKLIST)",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Scan ES and report counts without pushing to Redis",
+    ),
+) -> None:
+    """Load eligible product_ids from ES_URLS_INDEX and push into Redis queue.
+
+    Default eligibility:
+      - in ``user1_aliexpress_us_product_urls``
+      - not yet in ``user1_aliexpress_us_products``
+      - passes quality gates (price/rating/reviews/sold) when enabled
+      - not in category blacklist (clothing / adult) when enabled
+    """
+    from aliexpress_ds.category_blacklist import filter_items_by_category_blacklist
+    from aliexpress_ds.queue import get_product_queue
+
+    settings = get_settings()
+    try:
+        settings.require_es()
+        if not dry_run:
+            settings.require_queue_redis()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    use_quality = (
+        settings.enqueue_quality_filter if quality_filter is None else quality_filter
+    )
+    use_category_blacklist = (
+        settings.enqueue_category_blacklist
+        if category_blacklist is None
+        else category_blacklist
+    )
+    q_max_price = settings.enqueue_max_price if max_price is None else max_price
+    q_min_rating = settings.enqueue_min_rating if min_rating is None else min_rating
+    q_min_reviews = settings.enqueue_min_reviews if min_reviews is None else min_reviews
+    q_min_sold = (
+        settings.enqueue_min_sold_count if min_sold_count is None else min_sold_count
+    )
+
+    console.print("Connecting ES …")
+    es = make_es_client(settings)
+    existing: set[str] = set()
+    if skip_existing_products:
+        console.print(f"Loading product_ids from {settings.es_products_index} …")
+        existing = load_existing_product_ids(es, settings.es_products_index)
+        console.print(f"Already in products index: {len(existing)}")
+
+    if use_quality:
+        console.print(
+            f"Quality filter ON: price<{q_max_price} rating≥{q_min_rating} "
+            f"reviews≥{q_min_reviews} sold≥{q_min_sold}"
+        )
+    else:
+        console.print("Quality filter OFF")
+
+    if use_category_blacklist:
+        console.print(
+            "Category blacklist ON (skip 服装 / 成人用品 — "
+            "config/category_blacklist.yaml)"
+        )
+    else:
+        console.print("Category blacklist OFF")
+
+    console.print(f"Scanning {settings.es_urls_index} for candidates …")
+    if skip_existing_products:
+        pending = list(
+            iter_missing_urls(
+                es,
+                urls_index=settings.es_urls_index,
+                products_index=settings.es_products_index,
+                existing_ids=existing,
+                quality_filter=use_quality,
+                max_price=q_max_price,
+                min_rating=q_min_rating,
+                min_reviews=q_min_reviews,
+                min_sold_count=q_min_sold,
+            )
+        )
+    else:
+        from aliexpress_ds.es import urls_quality_query
+
+        pending = []
+        query = (
+            urls_quality_query(
+                max_price=q_max_price,
+                min_rating=q_min_rating,
+                min_reviews=q_min_reviews,
+                min_sold_count=q_min_sold,
+            )
+            if use_quality
+            else None
+        )
+        for doc in scroll_sources(
+            es,
+            settings.es_urls_index,
+            source_fields=[
+                "product_id",
+                "url",
+                "source",
+                "title",
+                "category",
+                "price",
+                "rating",
+                "reviews",
+                "sold_count",
+            ],
+            query=query,
+        ):
+            pid = str(doc.get("product_id") or "").strip()
+            if not pid:
+                continue
+            pending.append(
+                {
+                    "product_id": pid,
+                    "url": doc.get("url") or f"https://www.aliexpress.us/item/{pid}.html",
+                    "source": doc.get("source") or "aliexpress.us",
+                    "title": doc.get("title"),
+                    "category": doc.get("category"),
+                    "price": doc.get("price"),
+                    "rating": doc.get("rating"),
+                    "reviews": doc.get("reviews"),
+                    "sold_count": doc.get("sold_count"),
+                }
+            )
+
+    before_blacklist = len(pending)
+    blocked_category = 0
+    if use_category_blacklist:
+        pending, blocked_category = filter_items_by_category_blacklist(
+            pending,
+            blacklist_file=settings.enqueue_category_blacklist_file,
+            env_keywords=os.environ.get("ENQUEUE_CATEGORY_BLACKLIST_KEYWORDS", ""),
+        )
+        console.print(
+            f"Category blacklist removed {blocked_category} "
+            f"(before={before_blacklist} after={len(pending)})"
+        )
+
+    if limit and limit > 0:
+        pending = pending[:limit]
+
+    console.print(f"Candidates to enqueue: {len(pending)}")
+    if dry_run:
+        console.print("[yellow]dry-run[/yellow] — not writing to Redis")
+        for item in pending[:10]:
+            console.print(
+                f"  {item['product_id']}  cat={item.get('category')} "
+                f"price={item.get('price')} rating={item.get('rating')} "
+                f"reviews={item.get('reviews')} sold={item.get('sold_count')}"
+            )
+        if len(pending) > 10:
+            console.print(f"  … {len(pending) - 10} more")
+        return
+
+    q = get_product_queue(settings)
+    new, skipped = q.enqueue_many(pending, force=force)
+    console.print(
+        f"[green]Enqueued[/green] new={new} skipped={skipped} "
+        f"queue_len={q.length()} seen={q.seen_count()} "
+        f"→ {settings.redis_queue_key}"
+    )
+
+
+@app.command("enqueue-cny")
+def enqueue_cny(
+    force: bool = typer.Option(
+        True,
+        "--force/--no-force",
+        help="Re-enqueue even if product_id is in Redis seen set (default: force)",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Only report CNY docs without pushing to Redis",
+    ),
+) -> None:
+    """Re-queue products in ES_PRODUCTS_INDEX with currency=CNY for re-fetch."""
+    from aliexpress_ds.queue import get_product_queue
+
+    settings = get_settings()
+    try:
+        settings.require_es()
+        if not dry_run:
+            settings.require_queue_redis()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    es = make_es_client(settings)
+    console.print(f"Scanning {settings.es_products_index} for currency=CNY …")
+
+    pending: list[dict] = []
+    resp = es.search(
+        index=settings.es_products_index,
+        size=5000,
+        scroll="10m",
+        query={"match": {"currency": "CNY"}},
+        _source=["product_id", "url", "source", "category", "categories"],
+    )
+    scroll_id = resp.get("_scroll_id")
+    try:
+        while True:
+            hits = resp.get("hits", {}).get("hits", [])
+            if not hits:
+                break
+            for hit in hits:
+                src = hit.get("_source") or {}
+                pid = str(src.get("product_id") or "").strip()
+                if not pid:
+                    continue
+                url = str(src.get("url") or "").strip()
+                if not url:
+                    url = f"https://www.aliexpress.us/item/{pid}.html"
+                pending.append(
+                    {
+                        "product_id": pid,
+                        "url": url,
+                        "source": src.get("source") or "aliexpress.us",
+                        "category": src.get("category") or src.get("categories"),
+                    }
+                )
+            resp = es.scroll(scroll_id=scroll_id, scroll="10m")
+            scroll_id = resp.get("_scroll_id")
+    finally:
+        if scroll_id:
+            try:
+                es.clear_scroll(scroll_id=scroll_id)
+            except Exception:
+                pass
+
+    console.print(f"CNY products found: {len(pending)}")
+
+    # Prefer urls-index category breadcrumb when product doc lacks it.
+    for item in pending:
+        if item.get("category"):
+            continue
+        pid = item["product_id"]
+        for src in ("aliexpress.us", "aliexpress.com"):
+            try:
+                doc = es.get(index=settings.es_urls_index, id=f"{src}_{pid}")
+                cat = (doc.get("_source") or {}).get("category")
+                if cat:
+                    item["category"] = cat
+                    break
+            except Exception:
+                continue
+
+    if dry_run:
+        for item in pending[:10]:
+            console.print(f"  {item['product_id']}  {item.get('url')}")
+        if len(pending) > 10:
+            console.print(f"  … {len(pending) - 10} more")
+        return
+
+    q = get_product_queue(settings)
+    new, skipped = q.enqueue_many(pending, force=force)
+    console.print(
+        f"[green]Enqueued CNY refresh[/green] new={new} skipped={skipped} "
+        f"queue_len={q.length()} → {settings.redis_queue_key}"
+    )
+
+
+@app.command("queue-worker")
+def queue_worker(
+    country: str = typer.Option("US", "--country", "-c"),
+    currency: str = typer.Option("USD", "--currency"),
+    language: str = typer.Option("EN", "--language", "-l"),
+    delay: float = typer.Option(
+        -1.0,
+        "--delay",
+        help="Seconds between API calls; <0 uses ALIEXPRESS_MIN_INTERVAL_SEC",
+    ),
+    daily_limit: int = typer.Option(
+        -1,
+        "--daily-limit",
+        help="Max API calls/day (Beijing). <0 uses ALIEXPRESS_DAILY_LIMIT",
+    ),
+    once: bool = typer.Option(
+        False,
+        "--once",
+        help="Process at most one job then exit (also exits on empty queue)",
+    ),
+    max_jobs: int = typer.Option(
+        0,
+        "--max-jobs",
+        "-n",
+        help="Stop after N successful API attempts (0 = unlimited)",
+    ),
+    index_es: bool = typer.Option(
+        True,
+        "--index-es/--no-index-es",
+        help="Upsert StandardProduct into ES_PRODUCTS_INDEX",
+    ),
+    include_raw: bool = typer.Option(
+        False,
+        "--raw/--no-raw",
+        help="Also append full API payload to --output JSONL",
+    ),
+    output: Optional[Path] = typer.Option(
+        Path("data/ds_queue_products.jsonl"),
+        "--output",
+        "-o",
+        help="Append fetch results JSONL (set empty string to disable)",
+    ),
+    requeue_on_rate_limit: bool = typer.Option(
+        True,
+        "--requeue-on-rate-limit/--drop-on-rate-limit",
+        help="Put job back on queue when daily quota / hard rate limit stops work",
+    ),
+) -> None:
+    """Listen on Redis queue → DS product.get (info+price) → upsert ES products index."""
+    from aliexpress_ds.queue import get_product_queue
+    from aliexpress_ds.rate_limit import RateLimiter
+
+    settings = get_settings()
+    try:
+        settings.require_credentials()
+        settings.require_queue_redis()
+        if index_es:
+            settings.require_es()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    out_path: Path | None = output
+    if output is not None and str(output).strip() in ("", "-", "/dev/null"):
+        out_path = None
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    interval = settings.aliexpress_min_interval_sec if delay < 0 else delay
+    quota = settings.aliexpress_daily_limit if daily_limit < 0 else daily_limit
+    limiter = RateLimiter(
+        min_interval_sec=interval,
+        daily_limit=quota,
+        state_path=Path("data/rate_limit_state.json"),
+    )
+    if out_path is not None:
+        limiter.ensure_min_count(_count_rows_today(out_path))
+
+    q = get_product_queue(settings)
+    es = make_es_client(settings) if index_es else None
+    service = ProductService()
+
+    console.print(
+        f"Worker listening {settings.redis_queue_key} "
+        f"(len={q.length()}) → ES={settings.es_products_index if index_es else 'off'} "
+        f"pace≥{interval:.2f}s daily≤{quota or '∞'}"
+    )
+
+    fetched = 0
+    errors = 0
+    es_indexed = 0
+    idle_rounds = 0
+
+    while True:
+        job = q.blocking_pop()
+        if job is None:
+            idle_rounds += 1
+            if once:
+                console.print("Queue empty — exiting (--once)")
+                break
+            if idle_rounds == 1 or idle_rounds % 12 == 0:
+                console.print(f"… waiting for jobs (queue_len={q.length()})")
+            continue
+
+        idle_rounds = 0
+        pid = str(job.get("product_id") or "").strip()
+        if not pid:
+            err_console.print(f"[yellow]skip bad job:[/yellow] {job}")
+            continue
+
+        url = str(job.get("url") or "").strip() or f"https://www.aliexpress.us/item/{pid}.html"
+        source = str(job.get("source") or "aliexpress.us").strip()
+        item = {"product_id": pid, "url": url, "source": source}
+
+        success = False
+        stop_all = False
+        while not success:
+            try:
+                limiter.wait_turn()
+            except RuntimeError as exc:
+                err_console.print(f"[yellow]{exc}[/yellow]")
+                if requeue_on_rate_limit:
+                    q.requeue(job)
+                    console.print(f"Requeued {pid} (daily quota)")
+                stop_all = True
+                break
+
+            try:
+                summary = service.get_by_url(
+                    url,
+                    ship_to_country=country,
+                    target_currency=currency,
+                    target_language=language,
+                    local_country=country,
+                    local_language=language.lower(),
+                )
+                if settings.fetch_shipping_fee:
+                    limiter.wait_turn()
+                row = _write_product_row(
+                    summary=summary,
+                    item=item,
+                    include_raw=include_raw,
+                    ship_to_country=country,
+                    fetch_shipping=settings.fetch_shipping_fee,
+                )
+                product = row.get("product")
+                if out_path is not None:
+                    with out_path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                fetched += 1
+                success = True
+
+                if index_es and es is not None and isinstance(product, dict):
+                    try:
+                        es_indexed += upsert_standard_products(
+                            es,
+                            settings.es_products_index,
+                            [product],
+                        )
+                    except Exception as es_exc:
+                        err_console.print(
+                            f"[yellow]ES upsert failed {pid}:[/yellow] {es_exc}"
+                        )
+
+                price = product.get("price") if isinstance(product, dict) else None
+                console.print(
+                    f"[green]ok[/green] {pid} price={price} "
+                    f"es={es_indexed} remaining≈{limiter.remaining_today}"
+                )
+            except (ValueError, IopError, Exception) as exc:
+                limited, cool = _is_rate_limited(exc)
+                if limited:
+                    err_console.print(
+                        f"[yellow]Rate limited[/yellow] {exc}; cooling {cool:.0f}s"
+                    )
+                    limiter.penalize(cool)
+                    continue
+
+                errors += 1
+                err_row = {
+                    "ok": False,
+                    "product_id": pid,
+                    "url": url,
+                    "error": str(exc),
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if isinstance(exc, IopError) and exc.body is not None:
+                    err_row["error_body"] = exc.body
+                if out_path is not None:
+                    with out_path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(err_row, ensure_ascii=False) + "\n")
+                err_console.print(f"[red]{pid}[/red] {exc}")
+                if _auth_fatal(str(exc)):
+                    if requeue_on_rate_limit:
+                        q.requeue(job)
+                    err_console.print("[yellow]Stopping due to auth/sign error.[/yellow]")
+                    stop_all = True
+                break
+
+        if stop_all:
+            break
+        if once:
+            break
+        if max_jobs and fetched >= max_jobs:
+            console.print(f"Reached --max-jobs={max_jobs}")
+            break
+
+    console.print(
+        f"[green]Worker done[/green] fetched={fetched} es_indexed={es_indexed} "
+        f"errors={errors} queue_len={q.length()}"
+    )
 
 
 def main() -> None:

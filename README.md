@@ -44,6 +44,16 @@ uv run aliexpress-ds discover-feed -f "DS bestseller" -C 66 --pages 20 --sort vo
 
 自由关键词 / 全站类目爬取用 `aliexpress-link-crawler`（读 ES `user1_aliexpress_crawl_categories`）。
 
+## 按 product_id 取商品信息 / 价格
+
+```bash
+# 单个：URL 或纯数字 product_id
+uv run aliexpress-ds get 1005004506189269
+uv run aliexpress-ds get 'https://www.aliexpress.us/item/1005004506189269.html'
+```
+
+核心代码：`src/aliexpress_ds/product.py`（`aliexpress.ds.product.get`）→ `standard_mapper.py` → ES。
+
 ## 从 ES 差分拉取并写入 JSONL + ES 产品索引
 
 urls 索引 `user1_aliexpress_us_product_urls` 里、且不在 `user1_aliexpress_us_products` 的链接：
@@ -54,6 +64,86 @@ uv run aliexpress-ds fetch-es -o data/ds_products.jsonl
 
 # 先小批量
 uv run aliexpress-ds fetch-es -n 100 -o data/ds_products.jsonl
+```
+
+## Redis 队列：灌队 + 消费写 ES
+
+`.env` 里配置任务队列（与 OAuth 的 `REDIS_URL` 分开）：
+
+```env
+# OAuth token（Upstash，与 aliexpress-oauth 同源）
+REDIS_URL=rediss://default:PASSWORD@xxxxx.upstash.io:6379
+
+# 任务队列（GCP Redis）
+REDIS_QUEUE_URL=redis://:password@34.133.1.247:6379/0
+REDIS_QUEUE_KEY=aliexpress-ds:products
+REDIS_QUEUE_SEEN_KEY=aliexpress-ds:products:seen
+```
+
+```bash
+# 1) 从 ES urls 入队（默认带质量过滤 + 排除已在 products 索引）
+uv run aliexpress-ds enqueue-es
+uv run aliexpress-ds enqueue-es -n 500
+uv run aliexpress-ds enqueue-es --dry-run
+uv run aliexpress-ds queue-status
+
+# 覆盖阈值 / 关闭过滤
+uv run aliexpress-ds enqueue-es \
+  --max-price 100 --min-rating 4.4 --min-reviews 1000 --min-sold 1000
+uv run aliexpress-ds enqueue-es --no-quality-filter
+
+# 2) 常驻消费
+uv run aliexpress-ds queue-worker
+```
+
+`.env` 质量门槛（urls 索引字段）：
+
+| 变量 | 默认 | 条件 |
+|------|------|------|
+| `ENQUEUE_QUALITY_FILTER` | `1` | 启用过滤 |
+| `ENQUEUE_MAX_PRICE` | `100` | `price < 100` |
+| `ENQUEUE_MIN_RATING` | `4.4` | `rating ≥ 4.4` |
+| `ENQUEUE_MIN_REVIEWS` | `1000` | `reviews ≥ 1000` |
+| `ENQUEUE_MIN_SOLD_COUNT` | `1000` | `sold_count ≥ 1000` |
+
+类目黑名单（默认开，跳过 **服装** / **成人用品**）：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `ENQUEUE_CATEGORY_BLACKLIST` | `1` | 启用类目黑名单 |
+| `ENQUEUE_CATEGORY_BLACKLIST_FILE` | `config/category_blacklist.yaml` | 关键词列表 |
+| `ENQUEUE_CATEGORY_BLACKLIST_KEYWORDS` | — | 逗号覆盖，如 `服装,成人用品,clothing` |
+
+```bash
+uv run aliexpress-ds enqueue-es --no-category-blacklist   # 临时关闭
+```
+
+### 授权与自动刷新 Token
+
+1. **首次授权**（浏览器，一年内需在 refresh 过期前重做）：  
+   https://aliexpress-oauth.onrender.com/oauth/authorize  
+   成功后 token 写入 Upstash `REDIS_URL` 的 key `aliexpress:oauth:token`。
+2. **本项目自动读/刷新**：每次 API 调用前若 `access_token` 将在 **1 小时内**过期，会调 `/auth/token/refresh` 并写回同一 Redis。
+3. **手动**：`uv run aliexpress-ds refresh-token`（`--force` 强制刷新）。
+
+### 部署到 VPS（Admin@34.172.204.102）
+
+```bash
+./scripts/deploy_vps.sh
+```
+
+安装目录：`/home/Admin/aliexpress-ds`  
+systemd：
+
+| Unit | 作用 |
+|------|------|
+| `aliexpress-ds-queue-worker.service` | 常驻监听 Redis 队列 |
+| `aliexpress-ds-token-refresh.timer` | 每小时确保 token 新鲜 |
+
+```bash
+sudo systemctl status aliexpress-ds-queue-worker
+sudo journalctl -u aliexpress-ds-queue-worker -f
+sudo systemctl list-timers 'aliexpress-ds*'
 ```
 
 ## 官方限流（Test 应用）
