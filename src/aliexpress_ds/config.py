@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     # QPS is not a single published number for DS APIs — pace proactively and
     # back off using response ban seconds (ApiCallLimits / App Call Limited).
     aliexpress_daily_limit: int = 5000
-    aliexpress_min_interval_sec: float = 0.5  # ~2 QPS; adaptive up on flow-control
+    aliexpress_min_interval_sec: float = 1.0  # ~1 QPS; adaptive up on AppApiCallLimit
     aliexpress_max_retries: int = 6  # flow-control / transport retries per call
 
     # Quality gates for enqueue-es (from ES urls index listing fields).
@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     fetch_shipping_fee: bool = True
 
     # asyncio queue-worker: parallel products, sequential APIs per product
-    queue_concurrency: int = 3
+    queue_concurrency: int = 1
 
     def require_queue_redis(self) -> None:
         if not (self.redis_queue_url or "").strip():

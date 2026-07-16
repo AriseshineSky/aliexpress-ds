@@ -37,7 +37,7 @@ BEIJING = timezone(timedelta(hours=8))
 
 # Conservative defaults: Online apps rarely publish a fixed QPS for DS APIs.
 # Proactive pacing stays under typical soft caps; response-driven backoff handles the rest.
-DEFAULT_MIN_INTERVAL_SEC = 0.5  # ~2 QPS
+DEFAULT_MIN_INTERVAL_SEC = 1.0  # ~1 QPS; safer against AppApiCallLimit
 DEFAULT_DAILY_LIMIT = 5000  # Formal Test Environment
 MAX_ADAPTIVE_INTERVAL_SEC = 8.0
 MIN_ADAPTIVE_INTERVAL_SEC = 0.2
@@ -325,7 +325,7 @@ class RateLimiter:
             if cool >= 60.0 and fc.kind in {FlowKind.APP_API, FlowKind.API_QPS, FlowKind.UNKNOWN}:
                 new_base = min(
                     MAX_ADAPTIVE_INTERVAL_SEC,
-                    max(self.base_interval_sec * 1.5, self.base_interval_sec + 0.1, 0.35),
+                    max(self.base_interval_sec * 1.5, self.base_interval_sec + 0.1, 1.0),
                 )
                 if new_base > self.base_interval_sec:
                     logger.warning(
