@@ -43,6 +43,7 @@ sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-token-refresh.timer" /etc/systemd/syst
 sudo systemctl daemon-reload
 sudo systemctl enable --now aliexpress-ds-token-refresh.timer
 sudo systemctl enable --now aliexpress-ds-queue-worker.service
+sudo systemctl restart aliexpress-ds-queue-worker.service
 sudo systemctl status aliexpress-ds-queue-worker.service --no-pager -l | head -40
 sudo systemctl list-timers 'aliexpress-ds*' --no-pager
 EOF

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
+import threading
 from typing import Any, Iterator
 
 from elasticsearch import Elasticsearch
 
 from aliexpress_ds.config import Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 
 def make_es_client(settings: Settings | None = None) -> Elasticsearch:
@@ -245,6 +249,103 @@ def upsert_standard_products(
                 ok += 1
         return ok
     return len(actions) // 2
+
+
+class EsProductBuffer:
+    """Background bulk buffer so ES I/O stays off the API hot path.
+
+    Products are queued in-memory; a daemon thread flushes when ``max_size`` is
+    reached or ``flush_interval_sec`` elapses. Call ``close()`` on shutdown.
+    """
+
+    def __init__(
+        self,
+        es: Elasticsearch,
+        products_index: str,
+        *,
+        max_size: int = 25,
+        flush_interval_sec: float = 2.0,
+    ):
+        self.es = es
+        self.products_index = products_index
+        self.max_size = max(1, int(max_size))
+        self.flush_interval_sec = max(0.2, float(flush_interval_sec))
+        self._buf: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._indexed = 0
+        self._errors = 0
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="es-product-buffer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def indexed(self) -> int:
+        return self._indexed
+
+    @property
+    def errors(self) -> int:
+        return self._errors
+
+    @property
+    def pending(self) -> int:
+        with self._lock:
+            return len(self._buf)
+
+    def add(self, product: dict[str, Any]) -> None:
+        if not isinstance(product, dict):
+            return
+        should_flush = False
+        with self._lock:
+            self._buf.append(product)
+            should_flush = len(self._buf) >= self.max_size
+        if should_flush:
+            self._wake.set()
+
+    def flush(self) -> int:
+        """Synchronously flush the current buffer. Returns docs indexed this call."""
+        with self._lock:
+            batch = self._buf
+            self._buf = []
+        if not batch:
+            return 0
+        return self._write(batch)
+
+    def close(self) -> int:
+        self._stop.set()
+        self._wake.set()
+        self._thread.join(timeout=max(5.0, self.flush_interval_sec + 3.0))
+        return self.flush()
+
+    def _write(self, batch: list[dict[str, Any]]) -> int:
+        try:
+            n = upsert_standard_products(self.es, self.products_index, batch)
+            self._indexed += n
+            return n
+        except Exception as exc:
+            self._errors += 1
+            logger.warning(
+                "ES bulk flush failed (%s docs): %s",
+                len(batch),
+                exc,
+            )
+            return 0
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._wake.wait(timeout=self.flush_interval_sec)
+            self._wake.clear()
+            with self._lock:
+                if not self._buf:
+                    continue
+                batch = self._buf
+                self._buf = []
+            if batch:
+                self._write(batch)
 
 
 def upsert_docs(

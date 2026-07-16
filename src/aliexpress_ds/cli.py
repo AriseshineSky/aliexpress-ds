@@ -13,11 +13,11 @@ from rich.table import Table
 
 from aliexpress_ds.config import get_settings
 from aliexpress_ds.es import (
+    EsProductBuffer,
     iter_missing_urls,
     load_existing_product_ids,
     make_es_client,
     scroll_sources,
-    upsert_standard_products,
     upsert_url_docs,
 )
 from aliexpress_ds.iop_client import IopClient, IopError
@@ -189,6 +189,44 @@ def _write_product_row(
         row["raw"] = raw
     return row
 
+
+async def _awrite_product_row(
+    *,
+    summary,
+    item: dict,
+    include_raw: bool,
+    ship_to_country: str = "US",
+    fetch_shipping: bool = True,
+    client=None,
+) -> dict:
+    from aliexpress_ds.enrich import aenrich_product
+    from aliexpress_ds.standard_mapper import to_standard_product
+
+    raw = summary.raw or {}
+    product = to_standard_product(
+        raw,
+        url=item["url"],
+        source=item.get("source") or item.get("es_source"),
+    )
+    product = await aenrich_product(
+        product,
+        raw_payload=raw,
+        item=item,
+        ship_to_country=ship_to_country,
+        fetch_shipping=fetch_shipping,
+        client=client,
+    )
+    row = {
+        "ok": True,
+        "product_id": product.get("product_id") or summary.product_id,
+        "url": item["url"],
+        "source": item.get("source"),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "product": product,
+    }
+    if include_raw:
+        row["raw"] = raw
+    return row
 
 
 @app.command("parse-id")
@@ -746,6 +784,11 @@ def fetch_es(
         else IopClient(limiter=limiter, max_retries=settings.aliexpress_max_retries)
     )
     service = None if dry_run else ProductService(client=iop)
+    es_buf = (
+        EsProductBuffer(es, settings.es_products_index)
+        if index_es and not dry_run
+        else None
+    )
     fetched = 0
     skipped = 0
     errors = 0
@@ -810,20 +853,13 @@ def fetch_es(
                             )
                             quality_fh.flush()
                             quality_kept += 1
-                        if index_es and isinstance(product, dict):
-                            try:
-                                es_indexed += upsert_standard_products(
-                                    es,
-                                    settings.es_products_index,
-                                    [product],
-                                )
-                            except Exception as es_exc:
-                                err_console.print(
-                                    f"[yellow]ES upsert failed {pid}:[/yellow] {es_exc}"
-                                )
+                        if es_buf is not None and isinstance(product, dict):
+                            es_buf.add(product)
+                            es_indexed = es_buf.indexed
                         if fetched % 20 == 0:
                             console.print(
                                 f"… fetched {fetched} es={es_indexed} "
+                                f"pending_es={es_buf.pending if es_buf else 0} "
                                 f"quality={quality_kept} "
                                 f"interval≈{limiter.effective_interval:.2f}s "
                                 f"remaining_today≈{limiter.remaining_today}"
@@ -857,6 +893,11 @@ def fetch_es(
     finally:
         if quality_fh is not None:
             quality_fh.close()
+        if es_buf is not None:
+            es_buf.close()
+            es_indexed = es_buf.indexed
+        if iop is not None:
+            iop.close()
 
     msg = (
         f"[green]Done[/green] wrote={fetched} es_indexed={es_indexed} "
@@ -1209,6 +1250,13 @@ def queue_worker(
         "--daily-limit",
         help="Max API calls/day (Beijing). <0 uses ALIEXPRESS_DAILY_LIMIT",
     ),
+    concurrency: int = typer.Option(
+        -1,
+        "--concurrency",
+        "-j",
+        help="Parallel products (asyncio). <0 uses QUEUE_CONCURRENCY (default 3). "
+        "Each product still runs product.get → freight sequentially.",
+    ),
     once: bool = typer.Option(
         False,
         "--once",
@@ -1218,7 +1266,7 @@ def queue_worker(
         0,
         "--max-jobs",
         "-n",
-        help="Stop after N successful API attempts (0 = unlimited)",
+        help="Stop after N successful product fetches (0 = unlimited)",
     ),
     index_es: bool = typer.Option(
         True,
@@ -1242,8 +1290,14 @@ def queue_worker(
         help="Put job back on queue when daily quota / hard rate limit stops work",
     ),
 ) -> None:
-    """Listen on Redis queue → DS product.get (info+price) → upsert ES products index."""
-    from aliexpress_ds.queue import get_product_queue
+    """Listen on Redis queue → DS product.get (+ freight) → upsert ES.
+
+    Uses asyncio: N products in parallel, shared RateLimiter; APIs for one
+    product stay sequential (freight needs product.get SKU/price).
+    """
+    import asyncio
+
+    from aliexpress_ds.queue import get_async_product_queue
     from aliexpress_ds.rate_limit import RateLimiter
 
     settings = get_settings()
@@ -1264,6 +1318,11 @@ def queue_worker(
 
     interval = settings.aliexpress_min_interval_sec if delay < 0 else delay
     quota = settings.aliexpress_daily_limit if daily_limit < 0 else daily_limit
+    workers = 1 if once else (
+        settings.queue_concurrency if concurrency < 0 else concurrency
+    )
+    workers = max(1, int(workers))
+
     limiter = RateLimiter(
         min_interval_sec=interval,
         daily_limit=quota,
@@ -1272,128 +1331,167 @@ def queue_worker(
     if out_path is not None:
         limiter.ensure_min_count(_count_rows_today(out_path))
 
-    q = get_product_queue(settings)
-    es = make_es_client(settings) if index_es else None
-    iop = IopClient(limiter=limiter, max_retries=settings.aliexpress_max_retries)
-    service = ProductService(client=iop)
-
-    console.print(
-        f"Worker listening {settings.redis_queue_key} "
-        f"(len={q.length()}) → ES={settings.es_products_index if index_es else 'off'} "
-        f"pace≥{interval:.2f}s daily≤{quota or '∞'} retries≤{settings.aliexpress_max_retries}"
-    )
-
-    fetched = 0
-    errors = 0
-    es_indexed = 0
-    idle_rounds = 0
-
-    while True:
-        job = q.blocking_pop()
-        if job is None:
-            idle_rounds += 1
-            if once:
-                console.print("Queue empty — exiting (--once)")
-                break
-            if idle_rounds == 1 or idle_rounds % 12 == 0:
-                console.print(f"… waiting for jobs (queue_len={q.length()})")
-            continue
-
+    async def _run() -> tuple[int, int, int]:
+        q = get_async_product_queue(settings)
+        es = make_es_client(settings) if index_es else None
+        es_buf = (
+            EsProductBuffer(es, settings.es_products_index) if es is not None else None
+        )
+        iop = IopClient(limiter=limiter, max_retries=settings.aliexpress_max_retries)
+        service = ProductService(client=iop)
+        stop = asyncio.Event()
+        stats_lock = asyncio.Lock()
+        out_lock = asyncio.Lock()
+        fetched = 0
+        errors = 0
         idle_rounds = 0
-        pid = str(job.get("product_id") or "").strip()
-        if not pid:
-            err_console.print(f"[yellow]skip bad job:[/yellow] {job}")
-            continue
 
-        url = str(job.get("url") or "").strip() or f"https://www.aliexpress.us/item/{pid}.html"
-        source = str(job.get("source") or "aliexpress.us").strip()
-        # Keep category from enqueue job — DS leaf category_id rarely maps in the
-        # 549-node tree, so urls-index breadcrumb is the main categories source.
-        item = {
-            "product_id": pid,
-            "url": url,
-            "source": source,
-            "category": job.get("category") or job.get("categories"),
-        }
+        qlen = await q.length()
+        console.print(
+            f"Worker listening {settings.redis_queue_key} "
+            f"(len={qlen}) → ES={settings.es_products_index if index_es else 'off'} "
+            f"concurrency={workers} pace≥{interval:.2f}s daily≤{quota or '∞'} "
+            f"retries≤{settings.aliexpress_max_retries}"
+        )
 
-        try:
-            summary = service.get_by_url(
-                url,
-                ship_to_country=country,
-                target_currency=currency,
-                target_language=language,
-                local_country=country,
-                local_language=language.lower(),
-            )
-            row = _write_product_row(
-                summary=summary,
-                item=item,
-                include_raw=include_raw,
-                ship_to_country=country,
-                fetch_shipping=settings.fetch_shipping_fee,
-                client=iop,
-            )
-            product = row.get("product")
-            if out_path is not None:
-                with out_path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-            fetched += 1
+        async def process_job(job: dict) -> None:
+            nonlocal fetched, errors
+            pid = str(job.get("product_id") or "").strip()
+            if not pid:
+                err_console.print(f"[yellow]skip bad job:[/yellow] {job}")
+                return
 
-            if index_es and es is not None and isinstance(product, dict):
-                try:
-                    es_indexed += upsert_standard_products(
-                        es,
-                        settings.es_products_index,
-                        [product],
-                    )
-                except Exception as es_exc:
-                    err_console.print(
-                        f"[yellow]ES upsert failed {pid}:[/yellow] {es_exc}"
-                    )
-
-            price = product.get("price") if isinstance(product, dict) else None
-            console.print(
-                f"[green]ok[/green] {pid} price={price} "
-                f"es={es_indexed} interval≈{limiter.effective_interval:.2f}s "
-                f"remaining≈{limiter.remaining_today}"
-            )
-        except DailyQuotaExhausted as exc:
-            err_console.print(f"[yellow]{exc}[/yellow]")
-            if requeue_on_rate_limit:
-                q.requeue(job)
-                console.print(f"Requeued {pid} (daily quota)")
-            break
-        except (ValueError, IopError, Exception) as exc:
-            errors += 1
-            err_row = {
-                "ok": False,
+            url = str(job.get("url") or "").strip() or f"https://www.aliexpress.us/item/{pid}.html"
+            source = str(job.get("source") or "aliexpress.us").strip()
+            item = {
                 "product_id": pid,
                 "url": url,
-                "error": str(exc),
-                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "source": source,
+                "category": job.get("category") or job.get("categories"),
             }
-            if isinstance(exc, IopError) and exc.body is not None:
-                err_row["error_body"] = exc.body
-            if out_path is not None:
-                with out_path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(err_row, ensure_ascii=False) + "\n")
-            err_console.print(f"[red]{pid}[/red] {exc}")
-            if _auth_fatal(str(exc)):
+
+            try:
+                # Per product: product.get then freight (sequential).
+                summary = await service.aget_by_url(
+                    url,
+                    ship_to_country=country,
+                    target_currency=currency,
+                    target_language=language,
+                    local_country=country,
+                    local_language=language.lower(),
+                )
+                row = await _awrite_product_row(
+                    summary=summary,
+                    item=item,
+                    include_raw=include_raw,
+                    ship_to_country=country,
+                    fetch_shipping=settings.fetch_shipping_fee,
+                    client=iop,
+                )
+                product = row.get("product")
+                if out_path is not None:
+                    line = json.dumps(row, ensure_ascii=False) + "\n"
+                    async with out_lock:
+                        with out_path.open("a", encoding="utf-8") as fh:
+                            fh.write(line)
+
+                async with stats_lock:
+                    fetched += 1
+                    done_n = fetched
+
+                if es_buf is not None and isinstance(product, dict):
+                    es_buf.add(product)
+
+                price = product.get("price") if isinstance(product, dict) else None
+                console.print(
+                    f"[green]ok[/green] {pid} price={price} "
+                    f"es={es_buf.indexed if es_buf else 0} "
+                    f"pending_es={es_buf.pending if es_buf else 0} "
+                    f"fetched={done_n} "
+                    f"interval≈{limiter.effective_interval:.2f}s "
+                    f"remaining≈{limiter.remaining_today}"
+                )
+
+                if once or (max_jobs and done_n >= max_jobs):
+                    if max_jobs and done_n >= max_jobs:
+                        console.print(f"Reached --max-jobs={max_jobs}")
+                    stop.set()
+
+            except DailyQuotaExhausted as exc:
+                err_console.print(f"[yellow]{exc}[/yellow]")
                 if requeue_on_rate_limit:
-                    q.requeue(job)
-                err_console.print("[yellow]Stopping due to auth/sign error.[/yellow]")
-                break
+                    await q.requeue(job)
+                    console.print(f"Requeued {pid} (daily quota)")
+                stop.set()
+            except (ValueError, IopError, Exception) as exc:
+                async with stats_lock:
+                    errors += 1
+                err_row = {
+                    "ok": False,
+                    "product_id": pid,
+                    "url": url,
+                    "error": str(exc),
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if isinstance(exc, IopError) and exc.body is not None:
+                    err_row["error_body"] = exc.body
+                if out_path is not None:
+                    line = json.dumps(err_row, ensure_ascii=False) + "\n"
+                    async with out_lock:
+                        with out_path.open("a", encoding="utf-8") as fh:
+                            fh.write(line)
+                err_console.print(f"[red]{pid}[/red] {exc}")
+                if _auth_fatal(str(exc)):
+                    if requeue_on_rate_limit:
+                        await q.requeue(job)
+                    err_console.print("[yellow]Stopping due to auth/sign error.[/yellow]")
+                    stop.set()
 
-        if once:
-            break
-        if max_jobs and fetched >= max_jobs:
-            console.print(f"Reached --max-jobs={max_jobs}")
-            break
+        async def slot_worker(slot: int) -> None:
+            nonlocal idle_rounds
+            while not stop.is_set():
+                async with stats_lock:
+                    if max_jobs and fetched >= max_jobs:
+                        stop.set()
+                        return
+                job = await q.blocking_pop()
+                if stop.is_set():
+                    if job is not None:
+                        await q.requeue(job)
+                    return
+                if job is None:
+                    idle_rounds += 1
+                    if once:
+                        console.print("Queue empty — exiting (--once)")
+                        stop.set()
+                        return
+                    if idle_rounds == 1 or idle_rounds % 12 == 0:
+                        qlen_now = await q.length()
+                        console.print(f"… waiting for jobs (queue_len={qlen_now})")
+                    continue
+                idle_rounds = 0
+                await process_job(job)
 
-    console.print(
-        f"[green]Worker done[/green] fetched={fetched} es_indexed={es_indexed} "
-        f"errors={errors} queue_len={q.length()}"
-    )
+        try:
+            await asyncio.gather(*(slot_worker(i) for i in range(workers)))
+        finally:
+            es_indexed = 0
+            if es_buf is not None:
+                es_buf.close()
+                es_indexed = es_buf.indexed
+            await iop.aclose()
+            qlen_end = 0
+            try:
+                qlen_end = await q.length()
+            except Exception:
+                pass
+            await q.aclose()
+            console.print(
+                f"[green]Worker done[/green] fetched={fetched} es_indexed={es_indexed} "
+                f"errors={errors} queue_len={qlen_end}"
+            )
+
+    asyncio.run(_run())
 
 
 def main() -> None:

@@ -187,3 +187,61 @@ class ProductQueue:
 
 def get_product_queue(settings: Settings | None = None) -> ProductQueue:
     return ProductQueue(settings)
+
+
+class AsyncProductQueue:
+    """redis.asyncio BRPOP/LPUSH — no thread pool for queue waits."""
+
+    def __init__(self, settings: Settings | None = None):
+        import redis.asyncio as redis_async
+
+        self.settings = settings or get_settings()
+        url = (self.settings.redis_queue_url or "").strip()
+        if not url:
+            raise ValueError("REDIS_QUEUE_URL is not set")
+        kwargs: dict[str, Any] = {"decode_responses": True, "protocol": 2}
+        if url.startswith("rediss://"):
+            import ssl
+
+            kwargs["ssl_cert_reqs"] = ssl.CERT_NONE
+        self.client = redis_async.from_url(url, **kwargs)
+        self.queue_key = self.settings.redis_queue_key
+        self.seen_key = self.settings.redis_queue_seen_key
+        self.brpop_timeout = max(1, int(self.settings.redis_queue_brpop_timeout))
+
+    async def length(self) -> int:
+        return int(await self.client.llen(self.queue_key))
+
+    async def blocking_pop(self, timeout: int | None = None) -> dict[str, Any] | None:
+        to = self.brpop_timeout if timeout is None else max(1, int(timeout))
+        result = await self.client.brpop(self.queue_key, timeout=to)
+        if not result:
+            return None
+        _key, raw = result
+        return ProductQueue.decode_job(raw)
+
+    async def requeue(self, job: dict[str, Any]) -> None:
+        pid = str(job.get("product_id") or "").strip()
+        if not pid:
+            return
+        await self.client.lpush(
+            self.queue_key,
+            ProductQueue._encode_job(
+                pid,
+                url=job.get("url"),
+                source=job.get("source"),
+                extra={
+                    k: v
+                    for k, v in job.items()
+                    if k not in ("product_id", "url", "source") and v is not None
+                }
+                or None,
+            ),
+        )
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+
+def get_async_product_queue(settings: Settings | None = None) -> AsyncProductQueue:
+    return AsyncProductQueue(settings)

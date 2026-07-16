@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     # Product enrich on fetch (freight.calculate + categories)
     fetch_shipping_fee: bool = True
 
+    # asyncio queue-worker: parallel products, sequential APIs per product
+    queue_concurrency: int = 3
+
     def require_queue_redis(self) -> None:
         if not (self.redis_queue_url or "").strip():
             raise ValueError(

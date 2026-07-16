@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import ssl
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -21,15 +22,69 @@ logger = logging.getLogger(__name__)
 REDIS_TOKEN_KEY = "aliexpress:oauth:token"
 # Refresh when access_token expires within this window (avoid mid-request failures).
 REFRESH_SKEW = timedelta(hours=1)
+# Re-check Redis at least this often even if local expiry is later (other process may refresh).
+MEMORY_CACHE_MAX_AGE = timedelta(minutes=10)
+
+_redis_clients: dict[str, Any] = {}
+_redis_lock = threading.Lock()
+# redis_url (or "__env__") → (cached_at_monotonic, token_dict)
+_token_memory: dict[str, tuple[float, dict[str, Any]]] = {}
+_token_memory_lock = threading.Lock()
 
 
 def _redis_client(url: str):
+    """Reuse one Redis connection per URL (avoids TLS handshake per API call)."""
     import redis
 
-    kwargs: dict[str, Any] = {"socket_timeout": 10, "decode_responses": True, "protocol": 2}
-    if url.startswith("rediss://"):
-        kwargs["ssl_cert_reqs"] = ssl.CERT_NONE
-    return redis.from_url(url, **kwargs)
+    with _redis_lock:
+        client = _redis_clients.get(url)
+        if client is not None:
+            return client
+        kwargs: dict[str, Any] = {
+            "socket_timeout": 10,
+            "decode_responses": True,
+            "protocol": 2,
+            "health_check_interval": 30,
+        }
+        if url.startswith("rediss://"):
+            kwargs["ssl_cert_reqs"] = ssl.CERT_NONE
+        client = redis.from_url(url, **kwargs)
+        _redis_clients[url] = client
+        return client
+
+
+def _cache_key(settings: Settings) -> str:
+    url = (settings.redis_url or "").strip()
+    return url or "__env__"
+
+
+def _memory_get(settings: Settings) -> dict[str, Any] | None:
+    key = _cache_key(settings)
+    with _token_memory_lock:
+        entry = _token_memory.get(key)
+        if entry is None:
+            return None
+        cached_at, data = entry
+    age = time.monotonic() - cached_at
+    if age > MEMORY_CACHE_MAX_AGE.total_seconds():
+        return None
+    if access_token_expired(data):
+        return None
+    return data
+
+
+def _memory_put(settings: Settings, data: dict[str, Any]) -> None:
+    key = _cache_key(settings)
+    with _token_memory_lock:
+        _token_memory[key] = (time.monotonic(), dict(data))
+
+
+def _memory_clear(settings: Settings | None = None) -> None:
+    with _token_memory_lock:
+        if settings is None:
+            _token_memory.clear()
+            return
+        _token_memory.pop(_cache_key(settings), None)
 
 
 def load_token_from_redis(settings: Settings | None = None) -> dict[str, Any] | None:
@@ -66,6 +121,7 @@ def save_token_to_redis(payload: dict[str, Any], settings: Settings | None = Non
     client.set(REDIS_TOKEN_KEY, json.dumps(body, ensure_ascii=False))
     if ttl > 0:
         client.expire(REDIS_TOKEN_KEY, ttl)
+    _memory_put(settings, body)
     logger.info(
         "Saved token to Redis %s (expires_at=%s ttl=%ss)",
         REDIS_TOKEN_KEY,
@@ -229,8 +285,15 @@ def refresh_access_token(
 
 
 def ensure_fresh_token(settings: Settings | None = None) -> dict[str, Any]:
-    """Return usable token dict; refresh via API when access_token is near expiry."""
+    """Return usable token dict; refresh via API when access_token is near expiry.
+
+    Uses an in-process memory cache so hot paths skip Upstash on every call.
+    """
     settings = settings or get_settings()
+    cached = _memory_get(settings)
+    if cached is not None:
+        return cached
+
     data = load_token_from_redis(settings)
     if not data or not str(data.get("access_token") or "").strip():
         raise ValueError(
@@ -239,6 +302,7 @@ def ensure_fresh_token(settings: Settings | None = None) -> dict[str, Any]:
         )
 
     if not access_token_expired(data):
+        _memory_put(settings, data)
         return data
 
     refresh = str(data.get("refresh_token") or "").strip()
@@ -262,7 +326,7 @@ def resolve_access_token(settings: Settings | None = None) -> str:
             data = ensure_fresh_token(settings)
             token = str(data.get("access_token") or "").strip()
             if token:
-                logger.info("Using access_token from Redis (%s)", REDIS_TOKEN_KEY)
+                logger.debug("Using access_token from Redis (%s)", REDIS_TOKEN_KEY)
                 return token
         except ValueError as exc:
             logger.warning("Redis token unavailable: %s", exc)

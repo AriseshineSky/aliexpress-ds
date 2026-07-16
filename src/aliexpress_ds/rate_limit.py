@@ -19,6 +19,7 @@ then retry; do not hammer the API while banned.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -149,7 +150,11 @@ def parse_flow_control(exc: BaseException) -> FlowControl | None:
 
 
 class RateLimiter:
-    """Proactive pacing + adaptive slowdown + global ban cooldown."""
+    """Proactive pacing + adaptive slowdown + global ban cooldown.
+
+    Sync and async callers share the same counters. Sleeps never hold the lock,
+    so concurrent asyncio tasks can pipeline while still pacing starts.
+    """
 
     def __init__(
         self,
@@ -164,9 +169,15 @@ class RateLimiter:
         self.daily_limit = max(0, int(daily_limit))
         self.state_path = state_path or Path("data/rate_limit_state.json")
         self._lock = threading.Lock()
+        self._async_lock: asyncio.Lock | None = None
         self._last_call_at = 0.0
         self._cooldown_until = 0.0  # monotonic
         self._load()
+
+    def _get_async_lock(self) -> asyncio.Lock:
+        if self._async_lock is None:
+            self._async_lock = asyncio.Lock()
+        return self._async_lock
 
     def _today(self) -> str:
         return datetime.now(BEIJING).strftime("%Y-%m-%d")
@@ -199,35 +210,54 @@ class RateLimiter:
     def effective_interval(self) -> float:
         return self._effective_interval
 
+    def _prepare_turn_unlocked(self) -> float:
+        """Under lock: roll day / check quota. Return seconds to sleep, or 0 to claim.
+
+        Caller must claim with ``_claim_turn_unlocked`` when return value is 0.
+        """
+        today = self._today()
+        if today != self._day:
+            self._day = today
+            self._count = 0
+            self._effective_interval = self.base_interval_sec
+
+        if self.daily_limit > 0 and self._count >= self.daily_limit:
+            raise DailyQuotaExhausted(
+                f"Local daily API quota exhausted ({self.daily_limit}/day Beijing time). "
+                "Resume after 00:00 GMT+8, or raise ALIEXPRESS_DAILY_LIMIT to match Console."
+            )
+
+        now = time.monotonic()
+        cool_wait = self._cooldown_until - now
+        gap_wait = self._effective_interval - (now - self._last_call_at)
+        return max(0.0, cool_wait, gap_wait)
+
+    def _claim_turn_unlocked(self) -> None:
+        self._last_call_at = time.monotonic()
+        self._count += 1
+        self._save()
+
     def wait_turn(self) -> None:
         """Block until allowed to make the next API call."""
-        with self._lock:
-            today = self._today()
-            if today != self._day:
-                self._day = today
-                self._count = 0
-                self._effective_interval = self.base_interval_sec
+        while True:
+            with self._lock:
+                sleep_for = self._prepare_turn_unlocked()
+                if sleep_for <= 0:
+                    self._claim_turn_unlocked()
+                    return
+            time.sleep(sleep_for)
 
-            if self.daily_limit > 0 and self._count >= self.daily_limit:
-                raise DailyQuotaExhausted(
-                    f"Local daily API quota exhausted ({self.daily_limit}/day Beijing time). "
-                    "Resume after 00:00 GMT+8, or raise ALIEXPRESS_DAILY_LIMIT to match Console."
-                )
-
-            now = time.monotonic()
-            # Honor global ban / adaptive cooldown first.
-            cool_wait = self._cooldown_until - now
-            if cool_wait > 0:
-                time.sleep(cool_wait)
-                now = time.monotonic()
-
-            wait = self._effective_interval - (now - self._last_call_at)
-            if wait > 0:
-                time.sleep(wait)
-
-            self._last_call_at = time.monotonic()
-            self._count += 1
-            self._save()
+    async def wait_turn_async(self) -> None:
+        """Async variant — shared pacing across concurrent product tasks."""
+        while True:
+            async with self._get_async_lock():
+                # Also take threading lock so sync+async never interleave counters.
+                with self._lock:
+                    sleep_for = self._prepare_turn_unlocked()
+                    if sleep_for <= 0:
+                        self._claim_turn_unlocked()
+                        return
+            await asyncio.sleep(sleep_for)
 
     def ensure_min_count(self, count: int) -> None:
         """Raise today's counter if prior process already used calls."""
@@ -251,6 +281,21 @@ class RateLimiter:
 
     def apply_flow_control(self, fc: FlowControl) -> None:
         """Sleep for ban window and tighten pacing (official response-driven backoff)."""
+        cool = self._arm_flow_control(fc)
+        if cool > 0:
+            time.sleep(cool)
+            with self._lock:
+                self._last_call_at = time.monotonic()
+
+    async def apply_flow_control_async(self, fc: FlowControl) -> None:
+        cool = self._arm_flow_control(fc)
+        if cool > 0:
+            await asyncio.sleep(cool)
+            async with self._get_async_lock():
+                with self._lock:
+                    self._last_call_at = time.monotonic()
+
+    def _arm_flow_control(self, fc: FlowControl) -> float:
         cool = max(0.0, float(fc.cooldown_sec))
         with self._lock:
             if fc.stop_for_day or fc.kind is FlowKind.APP_DAILY:
@@ -258,7 +303,6 @@ class RateLimiter:
             until = time.monotonic() + cool
             if until > self._cooldown_until:
                 self._cooldown_until = until
-            # Slow proactive pacing after any flow-control hit.
             bumped = max(self._effective_interval * 1.5, self.base_interval_sec * 2.0, 1.0)
             self._effective_interval = min(MAX_ADAPTIVE_INTERVAL_SEC, bumped)
             logger.warning(
@@ -268,10 +312,7 @@ class RateLimiter:
                 cool,
                 self._effective_interval,
             )
-        if cool > 0:
-            time.sleep(cool)
-            with self._lock:
-                self._last_call_at = time.monotonic()
+        return cool
 
     def penalize(self, seconds: float) -> None:
         """Backward-compatible cooldown helper."""

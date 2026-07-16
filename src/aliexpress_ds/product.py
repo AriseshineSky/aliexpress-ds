@@ -85,6 +85,51 @@ class ProductService:
         result = _dig_result(payload)
         return _normalize(product_id, ship_to_country, result, payload)
 
+    async def aget_by_url(
+        self,
+        url_or_id: str,
+        *,
+        ship_to_country: str = "US",
+        target_currency: str = "USD",
+        target_language: str = "EN",
+        local_country: str | None = None,
+        local_language: str | None = None,
+    ) -> ProductSummary:
+        product_id = extract_product_id(url_or_id)
+        return await self.aget(
+            product_id,
+            ship_to_country=ship_to_country,
+            target_currency=target_currency,
+            target_language=target_language,
+            local_country=local_country,
+            local_language=local_language,
+        )
+
+    async def aget(
+        self,
+        product_id: str,
+        *,
+        ship_to_country: str = "US",
+        target_currency: str = "USD",
+        target_language: str = "EN",
+        local_country: str | None = None,
+        local_language: str | None = None,
+    ) -> ProductSummary:
+        params: dict[str, Any] = {
+            "product_id": product_id,
+            "ship_to_country": ship_to_country,
+            "target_currency": target_currency,
+            "target_language": target_language,
+        }
+        if local_country:
+            params["local_country"] = local_country
+        if local_language:
+            params["local_language"] = local_language
+
+        payload = await self.client.execute_async(self.API, params)
+        result = _dig_result(payload)
+        return _normalize(product_id, ship_to_country, result, payload)
+
 
 def _dig_result(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):

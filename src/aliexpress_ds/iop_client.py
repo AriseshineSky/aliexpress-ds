@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import threading
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -39,6 +40,9 @@ class IopClient:
       - Flow control (code 7 / ApiCallLimits / limited-by-*): wait ban seconds, retry
       - App daily quota: do not retry; raise DailyQuotaExhausted
       - Transient HTTP/transport: exponential backoff
+
+    Reuses sync ``httpx.Client`` and/or ``httpx.AsyncClient`` (keepalive).
+    Prefer ``execute_async`` from asyncio workers that share one RateLimiter.
     """
 
     def __init__(
@@ -57,6 +61,72 @@ class IopClient:
             if max_retries is not None
             else int(getattr(self.settings, "aliexpress_max_retries", 6) or 6)
         )
+        self._http: httpx.Client | None = None
+        self._http_async: httpx.AsyncClient | None = None
+        self._http_lock = threading.Lock()
+
+    def _http_client(self) -> httpx.Client:
+        client = self._http
+        if client is not None and not client.is_closed:
+            return client
+        with self._http_lock:
+            client = self._http
+            if client is None or client.is_closed:
+                self._http = httpx.Client(
+                    timeout=self.timeout,
+                    limits=httpx.Limits(
+                        max_connections=20,
+                        max_keepalive_connections=10,
+                        keepalive_expiry=30.0,
+                    ),
+                )
+            return self._http
+
+    def _http_async_client(self) -> httpx.AsyncClient:
+        client = self._http_async
+        if client is not None and not client.is_closed:
+            return client
+        with self._http_lock:
+            client = self._http_async
+            if client is None or client.is_closed:
+                self._http_async = httpx.AsyncClient(
+                    timeout=self.timeout,
+                    limits=httpx.Limits(
+                        max_connections=40,
+                        max_keepalive_connections=20,
+                        keepalive_expiry=30.0,
+                    ),
+                )
+            return self._http_async
+
+    def close(self) -> None:
+        with self._http_lock:
+            if self._http is not None and not self._http.is_closed:
+                self._http.close()
+            self._http = None
+
+    async def aclose(self) -> None:
+        with self._http_lock:
+            async_client = self._http_async
+            self._http_async = None
+            sync_client = self._http
+            self._http = None
+        if async_client is not None and not async_client.is_closed:
+            await async_client.aclose()
+        if sync_client is not None and not sync_client.is_closed:
+            sync_client.close()
+
+    def __enter__(self) -> IopClient:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    async def __aenter__(self) -> IopClient:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
 
     def execute(self, method: str, api_params: dict[str, Any] | None = None) -> dict[str, Any]:
         last_exc: BaseException | None = None
@@ -119,9 +189,74 @@ class IopClient:
         assert last_exc is not None
         raise last_exc
 
-    def _execute_once(
+    async def execute_async(
         self, method: str, api_params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        import asyncio
+
+        last_exc: BaseException | None = None
+        attempts = max(1, self.max_retries + 1)
+
+        for attempt in range(attempts):
+            if self.limiter is not None:
+                await self.limiter.wait_turn_async()
+
+            try:
+                payload = await self._execute_once_async(method, api_params)
+                if self.limiter is not None:
+                    self.limiter.note_success()
+                return payload
+            except DailyQuotaExhausted:
+                raise
+            except IopError as exc:
+                last_exc = exc
+                fc = parse_flow_control(exc)
+                if fc is None:
+                    raise
+                if fc.stop_for_day or fc.kind.value == "app_daily":
+                    if self.limiter is not None:
+                        await self.limiter.apply_flow_control_async(fc)
+                    raise DailyQuotaExhausted(
+                        f"Platform AppKey daily quota hit ({fc.sub_code or fc.kind.value}). "
+                        "Resume after 00:00 GMT+8."
+                    ) from exc
+                if attempt >= attempts - 1:
+                    raise
+                logger.warning(
+                    "IOP flow-control on %s attempt=%s/%s: %s — cooling %.1fs",
+                    method,
+                    attempt + 1,
+                    attempts,
+                    fc.kind.value,
+                    fc.cooldown_sec,
+                )
+                if self.limiter is not None:
+                    await self.limiter.apply_flow_control_async(fc)
+                else:
+                    await asyncio.sleep(fc.cooldown_sec)
+                continue
+            except (httpx.HTTPError, TimeoutError, OSError) as exc:
+                last_exc = exc
+                if not is_transient_transport(exc) or attempt >= attempts - 1:
+                    raise IopError(f"HTTP/transport error: {exc}", code="transport") from exc
+                delay = retry_sleep_seconds(attempt)
+                logger.warning(
+                    "IOP transport error on %s attempt=%s/%s: %s — backoff %.1fs",
+                    method,
+                    attempt + 1,
+                    attempts,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+        assert last_exc is not None
+        raise last_exc
+
+    def _build_request(
+        self, method: str, api_params: dict[str, Any] | None = None
+    ) -> tuple[str, dict[str, str]]:
         settings = self.settings
         settings.require_credentials()
 
@@ -130,10 +265,8 @@ class IopClient:
         access_token = resolve_access_token(settings)
 
         api_name = method if method.startswith("/") else f"/{method}"
-        # Business APIs like aliexpress.ds.product.get stay without leading slash in some gateways;
-        # for path-style (/auth/...) keep leading slash in the signature string.
         if "." in method and not method.startswith("/"):
-            api_name_for_sign = method  # TOP-style method name in signature for sync gateway
+            api_name_for_sign = method
             use_path_style = False
         else:
             api_name_for_sign = api_name
@@ -156,7 +289,6 @@ class IopClient:
 
         if use_path_style:
             url = settings.aliexpress_api_url.rstrip("/")
-            # Prefer /rest for auth; product calls usually use /sync with method param.
             if url.endswith("/sync") and api_name.startswith("/auth/"):
                 url = url[: -len("/sync")] + "/rest" + api_name
             elif url.endswith("/rest"):
@@ -168,29 +300,38 @@ class IopClient:
             url = settings.aliexpress_api_url
             body = dict(params)
             body["method"] = method
-            # re-sign including method for TOP, or path prepend without method in payload
-            # Official OP path APIs put method in URL; TOP puts method in body and
-            # signature basestring is sorted params WITHOUT prepending (TOP MD5 style).
-            # For DS on /sync with dotted method, AE SDK prepends nothing if method
-            # has no "/" — uses HMAC of sorted params only (ae_sdk logic).
             body.pop("sign", None)
             body["sign"] = self._sign(body, api_name="")
 
-        with httpx.Client(timeout=self.timeout) as client:
-            response = client.post(
-                url,
-                content=urlencode(body),
-                headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"},
-            )
-            response.raise_for_status()
-            payload = response.json()
+        return url, body
 
-        return self._unwrap(payload, method)
+    def _execute_once(
+        self, method: str, api_params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        url, body = self._build_request(method, api_params)
+        response = self._http_client().post(
+            url,
+            content=urlencode(body),
+            headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"},
+        )
+        response.raise_for_status()
+        return self._unwrap(response.json(), method)
+
+    async def _execute_once_async(
+        self, method: str, api_params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        url, body = self._build_request(method, api_params)
+        response = await self._http_async_client().post(
+            url,
+            content=urlencode(body),
+            headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"},
+        )
+        response.raise_for_status()
+        return self._unwrap(response.json(), method)
 
     def _sign(self, params: dict[str, str], api_name: str) -> str:
         p = {k: v for k, v in params.items() if k != "sign" and v is not None and str(v) != ""}
         if "method" in p and "/" in str(p.get("method", "")):
-            # OP style already in method field — prepend and exclude from pairs
             api_name = str(p.pop("method"))
         basestring = f"{api_name}{''.join(f'{k}{p[k]}' for k in sorted(p))}"
         return (

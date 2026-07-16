@@ -89,6 +89,61 @@ def fetch_shipping_fee(
         logger.warning("freight.calculate failed for %s: %s", product_id, exc)
         return None
 
+    return _parse_freight_amount(resp)
+
+
+async def afetch_shipping_fee(
+    *,
+    product_id: str,
+    skus: list[dict[str, Any]],
+    ship_to_country: str = "US",
+    send_goods_country_code: str = "CN",
+    client: IopClient | None = None,
+) -> float | None:
+    """Async freight.calculate — must run after product.get for the same item."""
+    sku = _pick_sku_for_freight(skus)
+    if not sku:
+        return None
+
+    sku_id = str(sku.get("sku_id") or sku.get("id") or "").strip()
+    if not sku_id:
+        return None
+
+    price = sku.get("offer_sale_price") or sku.get("sku_price")
+    if price is None:
+        return None
+
+    currency = str(sku.get("currency_code") or "USD").strip() or "USD"
+    dto = {
+        "product_id": int(str(product_id)),
+        "sku_id": sku_id,
+        "country_code": ship_to_country,
+        "send_goods_country_code": send_goods_country_code,
+        "product_num": 1,
+        "price": str(price),
+        "price_currency": currency,
+    }
+
+    client = client or IopClient()
+    try:
+        resp = await client.execute_async(
+            "aliexpress.logistics.buyer.freight.calculate",
+            {
+                "param_aeop_freight_calculate_for_buyer_d_t_o": json.dumps(
+                    dto, separators=(",", ":")
+                )
+            },
+        )
+    except DailyQuotaExhausted:
+        raise
+    except (IopError, ValueError, RuntimeError) as exc:
+        logger.warning("freight.calculate failed for %s: %s", product_id, exc)
+        return None
+
+    return _parse_freight_amount(resp)
+
+
+def _parse_freight_amount(resp: dict[str, Any]) -> float | None:
     options = _freight_list(resp)
     amounts: list[float] = []
     for opt in options:
