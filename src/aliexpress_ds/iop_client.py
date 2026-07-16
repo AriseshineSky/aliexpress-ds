@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -10,6 +11,15 @@ from urllib.parse import urlencode
 import httpx
 
 from aliexpress_ds.config import Settings, get_settings
+from aliexpress_ds.rate_limit import (
+    DailyQuotaExhausted,
+    RateLimiter,
+    is_transient_transport,
+    parse_flow_control,
+    retry_sleep_seconds,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class IopError(RuntimeError):
@@ -20,17 +30,98 @@ class IopError(RuntimeError):
 
 
 class IopClient:
-    """AliExpress IOP REST client.
+    """AliExpress IOP REST client with official flow-control retry.
 
     Signature (official):
       HMAC_SHA256(key=app_secret, data=api_path + sorted(key+value))
+
+    Retries:
+      - Flow control (code 7 / ApiCallLimits / limited-by-*): wait ban seconds, retry
+      - App daily quota: do not retry; raise DailyQuotaExhausted
+      - Transient HTTP/transport: exponential backoff
     """
 
-    def __init__(self, settings: Settings | None = None, *, timeout: float = 30.0):
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        timeout: float = 30.0,
+        limiter: RateLimiter | None = None,
+        max_retries: int | None = None,
+    ):
         self.settings = settings or get_settings()
         self.timeout = timeout
+        self.limiter = limiter
+        self.max_retries = (
+            int(max_retries)
+            if max_retries is not None
+            else int(getattr(self.settings, "aliexpress_max_retries", 6) or 6)
+        )
 
     def execute(self, method: str, api_params: dict[str, Any] | None = None) -> dict[str, Any]:
+        last_exc: BaseException | None = None
+        attempts = max(1, self.max_retries + 1)
+
+        for attempt in range(attempts):
+            if self.limiter is not None:
+                self.limiter.wait_turn()
+
+            try:
+                payload = self._execute_once(method, api_params)
+                if self.limiter is not None:
+                    self.limiter.note_success()
+                return payload
+            except DailyQuotaExhausted:
+                raise
+            except IopError as exc:
+                last_exc = exc
+                fc = parse_flow_control(exc)
+                if fc is None:
+                    raise
+                if fc.stop_for_day or fc.kind.value == "app_daily":
+                    if self.limiter is not None:
+                        self.limiter.apply_flow_control(fc)
+                    raise DailyQuotaExhausted(
+                        f"Platform AppKey daily quota hit ({fc.sub_code or fc.kind.value}). "
+                        "Resume after 00:00 GMT+8."
+                    ) from exc
+                if attempt >= attempts - 1:
+                    raise
+                logger.warning(
+                    "IOP flow-control on %s attempt=%s/%s: %s — cooling %.1fs",
+                    method,
+                    attempt + 1,
+                    attempts,
+                    fc.kind.value,
+                    fc.cooldown_sec,
+                )
+                if self.limiter is not None:
+                    self.limiter.apply_flow_control(fc)
+                else:
+                    time.sleep(fc.cooldown_sec)
+                continue
+            except (httpx.HTTPError, TimeoutError, OSError) as exc:
+                last_exc = exc
+                if not is_transient_transport(exc) or attempt >= attempts - 1:
+                    raise IopError(f"HTTP/transport error: {exc}", code="transport") from exc
+                delay = retry_sleep_seconds(attempt)
+                logger.warning(
+                    "IOP transport error on %s attempt=%s/%s: %s — backoff %.1fs",
+                    method,
+                    attempt + 1,
+                    attempts,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+
+        assert last_exc is not None
+        raise last_exc
+
+    def _execute_once(
+        self, method: str, api_params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         settings = self.settings
         settings.require_credentials()
 

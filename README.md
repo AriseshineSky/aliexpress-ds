@@ -146,16 +146,30 @@ sudo journalctl -u aliexpress-ds-queue-worker -f
 sudo systemctl list-timers 'aliexpress-ds*'
 ```
 
-## 官方限流（Test 应用）
+## 官方限流（Open Platform）
 
-| 规则 | 来源 | 本项目默认 |
-|------|------|-----------|
-| **5,000 次/天/应用**（北京时间） | [Formal Test Environment](https://open.alitrip.com/docs/doc.htm?articleId=108105&docType=1) | `ALIEXPRESS_DAILY_LIMIT=5000` |
-| App / API / 未上线应用 QPS 流控（`App Call Limited` / `ApiCallLimits`） | [API access count limitation](https://open.alitrip.com/docs/doc.htm?articleId=108426&docType=1) | `ALIEXPRESS_MIN_INTERVAL_SEC=1.0`（约 ≤1 QPS） |
+官方文档不公布每个 DS API 的固定 QPS，而是三类限制 + response 退避：
 
-- 日配额用尽到次日 00:00（GMT+8）才恢复；到达配额后 `fetch-es` 会停止。
-- 遇到流控会按返回的 ban 秒数冷却并重试同一商品。
-- 上线（Release）后日配额按应用类目提高；可在 Console 申请更多流量。
+| 限制 | 子错误码 / 表现 | 处理 |
+|------|-----------------|------|
+| **AppKey 日配额**（北京时间） | `accesscontrol.limited-by-app-access-count`；Test=5000/天，上线后看 Console | 等到次日 00:00 GMT+8；本地用 `ALIEXPRESS_DAILY_LIMIT` 对齐 Console |
+| **API 级 QPS**（全平台） | `accesscontrol.limited-by-api-access-count` / `ApiCallLimits`；`ban will last N seconds` | **睡 N+1 秒后重试** |
+| **App+API 频率**（未上线常见） | `accesscontrol.limited-by-app-api-access-count`；错误码 **7** `App Call Limited` | 同上；上线后通常放宽 |
+
+文档：
+- [API access count limitation](https://open.alitrip.com/docs/doc.htm?articleId=108426&docType=1)
+- [App Call Limited (code 7)](https://developer.alibaba.com/docs/doc.htm?articleId=108869&docType=1)
+- [Environments (Test 5k / Online by category)](https://open.fliggy.com/docs/doc.htm?articleId=108101&docType=1)
+
+本项目默认：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `ALIEXPRESS_DAILY_LIMIT` | `5000` | 对齐 Test；上线后改成 Console 流量包（如 `100000`） |
+| `ALIEXPRESS_MIN_INTERVAL_SEC` | `0.5` | 主动约 ≤2 QPS；遇流控会自适应拉长间隔 |
+| `ALIEXPRESS_MAX_RETRIES` | `6` | 每次 API：按 ban 秒数退避重试；传输错误指数退避 |
+
+`IopClient.execute` 统一：限速 → 发请求 → 解析流控 → 等待官方 ban 秒数 → 重试；日配额耗尽抛 `DailyQuotaExhausted` 并停工。
 
 每行 JSONL 结构：
 

@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from aliexpress_ds.iop_client import IopClient, IopError
+from aliexpress_ds.rate_limit import DailyQuotaExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,8 @@ def fetch_shipping_fee(
                 )
             },
         )
+    except DailyQuotaExhausted:
+        raise
     except (IopError, ValueError, RuntimeError) as exc:
         logger.warning("freight.calculate failed for %s: %s", product_id, exc)
         return None

@@ -1,38 +1,171 @@
+"""AliExpress Open Platform call pacing + flow-control parsing.
+
+Official rules (see README / Open Platform docs):
+
+1. Per AppKey daily quota (Beijing GMT+8). Test/formal-test = 5,000/day.
+   Online apps: category-dependent (check Console). Exhaustion lasts until 24:00 GMT+8.
+   Sub-code: ``accesscontrol.limited-by-app-access-count``
+
+2. Per-API QPS / minute caps (all apps). Response often includes
+   ``This ban will last for N more seconds`` / ``ApiCallLimits``.
+   Sub-code: ``accesscontrol.limited-by-api-access-count``
+
+3. Per AppKey+API (common for unreleased apps).
+   Sub-code: ``accesscontrol.limited-by-app-api-access-count``
+
+Error code ``7`` / ``App Call Limited`` covers the above. Wait the ban window,
+then retry; do not hammer the API while banned.
+"""
+
 from __future__ import annotations
 
 import json
+import logging
+import re
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 BEIJING = timezone(timedelta(hours=8))
 
+# Conservative defaults: Online apps rarely publish a fixed QPS for DS APIs.
+# Proactive pacing stays under typical soft caps; response-driven backoff handles the rest.
+DEFAULT_MIN_INTERVAL_SEC = 0.5  # ~2 QPS
+DEFAULT_DAILY_LIMIT = 5000  # Formal Test Environment
+MAX_ADAPTIVE_INTERVAL_SEC = 8.0
+MIN_ADAPTIVE_INTERVAL_SEC = 0.2
+
+
+class FlowKind(str, Enum):
+    APP_DAILY = "app_daily"  # stop until next Beijing day
+    API_QPS = "api_qps"  # wait ban seconds
+    APP_API = "app_api"  # wait ban seconds (often unreleased apps)
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class FlowControl:
+    kind: FlowKind
+    cooldown_sec: float
+    stop_for_day: bool = False
+    sub_code: str = ""
+
+
+class DailyQuotaExhausted(RuntimeError):
+    """Local or platform daily AppKey quota exhausted (Beijing day)."""
+
+
+def seconds_until_beijing_midnight() -> float:
+    now = datetime.now(BEIJING)
+    nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(1.0, (nxt - now).total_seconds())
+
+
+def _exc_blob(exc: BaseException) -> str:
+    parts = [str(exc)]
+    code = getattr(exc, "code", None)
+    if code is not None:
+        parts.append(str(code))
+    body = getattr(exc, "body", None)
+    if body is not None:
+        try:
+            parts.append(json.dumps(body, ensure_ascii=False))
+        except (TypeError, ValueError):
+            parts.append(str(body))
+    return "\n".join(parts).lower()
+
+
+def parse_ban_seconds(blob: str, *, default: float = 1.0) -> float:
+    """Extract ban window from official messages; default 1s (ApiCallLimits FAQ)."""
+    patterns = (
+        r"last(?:s)?\s+for\s+(\d+)\s+more\s+seconds",
+        r"ban will last\s+(\d+)\s+seconds",
+        r"last\s+(\d+)\s+seconds",
+        r"retry after\s+(\d+)",
+        r"wait\s+(\d+)\s+seconds",
+    )
+    for pat in patterns:
+        m = re.search(pat, blob, flags=re.I)
+        if m:
+            return float(m.group(1)) + 1.0  # +1s safety margin
+    return max(default, 1.0)
+
+
+def parse_flow_control(exc: BaseException) -> FlowControl | None:
+    """Return FlowControl if ``exc`` is an Open Platform rate/flow limit error."""
+    blob = _exc_blob(exc)
+    code = str(getattr(exc, "code", "") or "").strip()
+
+    markers = (
+        "apicalllimits",
+        "app call limited",
+        "call limited",
+        "accesscontrol.limited",
+        "limited-by-app",
+        "limited-by-api",
+        "ban will last",
+        "flowlimit",
+        "frequency",
+        "api access frequency exceeds",
+    )
+    code_hit = code in {"7", "ApiCallLimits", "App Call Limited"}
+    if not code_hit and not any(m in blob for m in markers):
+        return None
+
+    ban = parse_ban_seconds(blob, default=1.0)
+
+    if "limited-by-app-access-count" in blob:
+        return FlowControl(
+            FlowKind.APP_DAILY,
+            cooldown_sec=seconds_until_beijing_midnight(),
+            stop_for_day=True,
+            sub_code="accesscontrol.limited-by-app-access-count",
+        )
+    if "limited-by-app-api-access-count" in blob:
+        return FlowControl(
+            FlowKind.APP_API,
+            cooldown_sec=max(ban, 1.0),
+            sub_code="accesscontrol.limited-by-app-api-access-count",
+        )
+    if "limited-by-api-access-count" in blob or "apicalllimits" in blob:
+        return FlowControl(
+            FlowKind.API_QPS,
+            cooldown_sec=max(ban, 1.0),
+            sub_code="accesscontrol.limited-by-api-access-count",
+        )
+    if "app call limited" in blob or code == "7":
+        return FlowControl(
+            FlowKind.UNKNOWN,
+            cooldown_sec=max(ban, 60.0 if ban <= 1.0 else ban),
+            sub_code=code or "7",
+        )
+    return FlowControl(FlowKind.UNKNOWN, cooldown_sec=max(ban, 1.0))
+
 
 class RateLimiter:
-    """AliExpress Open Platform call pacing.
-
-    Official (Test / Formal Test Environment):
-      - 5,000 API calls per app per day
-      - Additional QPS / App Call Limited bans (ApiCallLimits)
-
-    See:
-      https://open.alitrip.com/docs/doc.htm?articleId=108105&docType=1
-      https://developer.alibaba.com/docs/doc.htm?articleId=108869&docType=1
-    """
+    """Proactive pacing + adaptive slowdown + global ban cooldown."""
 
     def __init__(
         self,
         *,
-        min_interval_sec: float = 1.0,
-        daily_limit: int = 5000,
+        min_interval_sec: float = DEFAULT_MIN_INTERVAL_SEC,
+        daily_limit: int = DEFAULT_DAILY_LIMIT,
         state_path: Path | None = None,
     ):
-        self.min_interval_sec = max(0.0, float(min_interval_sec))
+        self.base_interval_sec = max(0.0, float(min_interval_sec))
+        self.min_interval_sec = self.base_interval_sec
+        self._effective_interval = self.base_interval_sec
         self.daily_limit = max(0, int(daily_limit))
         self.state_path = state_path or Path("data/rate_limit_state.json")
         self._lock = threading.Lock()
         self._last_call_at = 0.0
+        self._cooldown_until = 0.0  # monotonic
         self._load()
 
     def _today(self) -> str:
@@ -62,23 +195,33 @@ class RateLimiter:
             return None
         return max(0, self.daily_limit - self._count)
 
+    @property
+    def effective_interval(self) -> float:
+        return self._effective_interval
+
     def wait_turn(self) -> None:
-        """Block until allowed to make the next API call. Raises if daily quota exhausted."""
+        """Block until allowed to make the next API call."""
         with self._lock:
             today = self._today()
             if today != self._day:
                 self._day = today
                 self._count = 0
+                self._effective_interval = self.base_interval_sec
 
             if self.daily_limit > 0 and self._count >= self.daily_limit:
-                raise RuntimeError(
-                    f"Daily API quota exhausted ({self.daily_limit}/day Beijing time). "
-                    "Test apps are limited to 5,000 calls/day per official docs. "
-                    "Resume after 00:00 GMT+8, or release the app and raise quota in Console."
+                raise DailyQuotaExhausted(
+                    f"Local daily API quota exhausted ({self.daily_limit}/day Beijing time). "
+                    "Resume after 00:00 GMT+8, or raise ALIEXPRESS_DAILY_LIMIT to match Console."
                 )
 
             now = time.monotonic()
-            wait = self.min_interval_sec - (now - self._last_call_at)
+            # Honor global ban / adaptive cooldown first.
+            cool_wait = self._cooldown_until - now
+            if cool_wait > 0:
+                time.sleep(cool_wait)
+                now = time.monotonic()
+
+            wait = self._effective_interval - (now - self._last_call_at)
             if wait > 0:
                 time.sleep(wait)
 
@@ -87,7 +230,7 @@ class RateLimiter:
             self._save()
 
     def ensure_min_count(self, count: int) -> None:
-        """Raise today's counter if prior process already used calls (e.g. JSONL rows)."""
+        """Raise today's counter if prior process already used calls."""
         with self._lock:
             today = self._today()
             if today != self._day:
@@ -97,11 +240,71 @@ class RateLimiter:
                 self._count = count
                 self._save()
 
-    def penalize(self, seconds: float) -> None:
-        """Extra cooldown after ApiCallLimits / App Call Limited."""
-        seconds = max(0.0, float(seconds))
-        if seconds <= 0:
-            return
+    def note_success(self) -> None:
+        """Gradually recover toward base interval after healthy calls."""
         with self._lock:
-            time.sleep(seconds)
-            self._last_call_at = time.monotonic()
+            if self._effective_interval <= self.base_interval_sec:
+                self._effective_interval = self.base_interval_sec
+                return
+            recovered = self._effective_interval * 0.9
+            self._effective_interval = max(self.base_interval_sec, recovered)
+
+    def apply_flow_control(self, fc: FlowControl) -> None:
+        """Sleep for ban window and tighten pacing (official response-driven backoff)."""
+        cool = max(0.0, float(fc.cooldown_sec))
+        with self._lock:
+            if fc.stop_for_day or fc.kind is FlowKind.APP_DAILY:
+                cool = max(cool, seconds_until_beijing_midnight())
+            until = time.monotonic() + cool
+            if until > self._cooldown_until:
+                self._cooldown_until = until
+            # Slow proactive pacing after any flow-control hit.
+            bumped = max(self._effective_interval * 1.5, self.base_interval_sec * 2.0, 1.0)
+            self._effective_interval = min(MAX_ADAPTIVE_INTERVAL_SEC, bumped)
+            logger.warning(
+                "Flow control kind=%s sub=%s sleep=%.1fs interval→%.2fs",
+                fc.kind.value,
+                fc.sub_code or "-",
+                cool,
+                self._effective_interval,
+            )
+        if cool > 0:
+            time.sleep(cool)
+            with self._lock:
+                self._last_call_at = time.monotonic()
+
+    def penalize(self, seconds: float) -> None:
+        """Backward-compatible cooldown helper."""
+        self.apply_flow_control(
+            FlowControl(FlowKind.UNKNOWN, cooldown_sec=max(0.0, float(seconds)))
+        )
+
+
+def is_transient_transport(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if "timeout" in name or "timeout" in msg:
+        return True
+    if "connect" in name or "transport" in name:
+        return True
+    markers = ("temporarily unavailable", "connection reset", "broken pipe", "503", "502", "504")
+    return any(m in msg for m in markers)
+
+
+def retry_sleep_seconds(attempt: int, *, base: float = 1.0, cap: float = 30.0) -> float:
+    """Exponential backoff for transient transport errors: 1, 2, 4, …"""
+    return min(cap, base * (2**max(0, attempt)))
+
+
+def describe_limits(*, daily_limit: int, min_interval: float) -> dict[str, Any]:
+    return {
+        "daily_limit": daily_limit or "unlimited(local)",
+        "min_interval_sec": min_interval,
+        "approx_qps": (1.0 / min_interval) if min_interval > 0 else "unlimited",
+        "beijing_day": datetime.now(BEIJING).strftime("%Y-%m-%d"),
+        "docs": {
+            "access_count": "https://open.alitrip.com/docs/doc.htm?articleId=108426&docType=1",
+            "app_call_limited": "https://developer.alibaba.com/docs/doc.htm?articleId=108869&docType=1",
+            "environments": "https://open.fliggy.com/docs/doc.htm?articleId=108101&docType=1",
+        },
+    }

@@ -20,9 +20,11 @@ from aliexpress_ds.es import (
     upsert_standard_products,
     upsert_url_docs,
 )
-from aliexpress_ds.iop_client import IopError
+from aliexpress_ds.iop_client import IopClient, IopError
 from aliexpress_ds.product import ProductService
+from aliexpress_ds.rate_limit import DailyQuotaExhausted
 from aliexpress_ds.url_parser import extract_product_id
+
 BEIJING = timezone(timedelta(hours=8))
 
 app = typer.Typer(
@@ -156,6 +158,7 @@ def _write_product_row(
     include_raw: bool,
     ship_to_country: str = "US",
     fetch_shipping: bool = True,
+    client=None,
 ) -> dict:
     from aliexpress_ds.enrich import enrich_product
     from aliexpress_ds.standard_mapper import to_standard_product
@@ -172,6 +175,7 @@ def _write_product_row(
         item=item,
         ship_to_country=ship_to_country,
         fetch_shipping=fetch_shipping,
+        client=client,
     )
     row = {
         "ok": True,
@@ -513,7 +517,6 @@ def discover_feed(
     Affiliate keyword search needs separate Affiliate API permission (your app currently lacks it).
     """
     from aliexpress_ds.feed import FeedService, extract_products, product_to_url_doc
-    from aliexpress_ds.iop_client import IopError
     from aliexpress_ds.rate_limit import RateLimiter
 
     settings = get_settings()
@@ -531,14 +534,13 @@ def discover_feed(
         daily_limit=settings.aliexpress_daily_limit,
         state_path=Path("data/rate_limit_state.json"),
     )
-    service = FeedService()
+    service = FeedService(client=IopClient(limiter=limiter))
     docs: list[dict] = []
     seen: set[str] = set()
 
     with output.open("a", encoding="utf-8") as fh:
         for page in range(1, max(pages, 1) + 1):
             try:
-                limiter.wait_turn()
                 payload = service.recommend(
                     feed_name=feed_name,
                     category_id=category_id,
@@ -547,7 +549,7 @@ def discover_feed(
                     page_size=page_size,
                     sort=sort,
                 )
-            except (ValueError, IopError, RuntimeError) as exc:
+            except (ValueError, IopError, DailyQuotaExhausted, RuntimeError) as exc:
                 err_console.print(f"[red]page {page}:[/red] {exc}")
                 if isinstance(exc, IopError) and exc.body is not None:
                     err_console.print_json(data=exc.body)
@@ -577,30 +579,12 @@ def discover_feed(
 
 def _is_rate_limited(exc: Exception) -> tuple[bool, float]:
     """Detect Open Platform flow-control errors; return (matched, cooldown_seconds)."""
-    msg = str(exc)
-    low = msg.lower()
-    body = ""
-    if isinstance(exc, IopError) and exc.body is not None:
-        body = json.dumps(exc.body, ensure_ascii=False).lower()
-    blob = f"{low}\n{body}"
-    markers = (
-        "apicalllimits",
-        "app call limited",
-        "call limited",
-        "accesscontrol.limited",
-        "limited-by-app",
-        "limited-by-api",
-        "ban will last",
-        "flowlimit",
-        "frequency",
-    )
-    if not any(m in blob for m in markers):
-        return False, 0.0
+    from aliexpress_ds.rate_limit import parse_flow_control
 
-    m = re.search(r"last(?:s)?\s+for\s+(\d+)\s+more\s+seconds", blob)
-    if m:
-        return True, float(m.group(1)) + 1.0
-    return True, 60.0
+    fc = parse_flow_control(exc)
+    if fc is None:
+        return False, 0.0
+    return True, fc.cooldown_sec
 
 
 def _count_rows_today(path: Path) -> int:
@@ -756,7 +740,12 @@ def fetch_es(
             f"reviews≥{DEFAULT_MIN_REVIEWS} sold≥{DEFAULT_MIN_SOLD_COUNT})"
         )
 
-    service = None if dry_run else ProductService()
+    iop = (
+        None
+        if dry_run
+        else IopClient(limiter=limiter, max_retries=settings.aliexpress_max_retries)
+    )
+    service = None if dry_run else ProductService(client=iop)
     fetched = 0
     skipped = 0
     errors = 0
@@ -788,100 +777,80 @@ def fetch_es(
                     fh.write(json.dumps(row, ensure_ascii=False) + "\n")
                     fetched += 1
                 else:
-                    assert service is not None and limiter is not None
-                    success = False
-                    stop_all = False
-                    while not success:
-                        try:
-                            limiter.wait_turn()
-                        except RuntimeError as exc:
-                            err_console.print(f"[yellow]{exc}[/yellow]")
-                            stop_all = True
-                            break
-
-                        try:
-                            summary = service.get_by_url(
-                                item["url"],
-                                ship_to_country=country,
-                                target_currency=currency,
-                                target_language=language,
-                                local_country=country,
-                                local_language=language.lower(),
+                    assert service is not None and limiter is not None and iop is not None
+                    try:
+                        summary = service.get_by_url(
+                            item["url"],
+                            ship_to_country=country,
+                            target_currency=currency,
+                            target_language=language,
+                            local_country=country,
+                            local_language=language.lower(),
+                        )
+                        row = _write_product_row(
+                            summary=summary,
+                            item=item,
+                            include_raw=include_raw,
+                            ship_to_country=country,
+                            fetch_shipping=settings.fetch_shipping_fee,
+                            client=iop,
+                        )
+                        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        fh.flush()
+                        fetched += 1
+                        done.add(pid)
+                        product = row.get("product")
+                        if (
+                            quality_fh is not None
+                            and isinstance(product, dict)
+                            and product_meets_quality(product)
+                        ):
+                            quality_fh.write(
+                                json.dumps(row, ensure_ascii=False) + "\n"
                             )
-                            if settings.fetch_shipping_fee:
-                                limiter.wait_turn()
-                            row = _write_product_row(
-                                summary=summary,
-                                item=item,
-                                include_raw=include_raw,
-                                ship_to_country=country,
-                                fetch_shipping=settings.fetch_shipping_fee,
+                            quality_fh.flush()
+                            quality_kept += 1
+                        if index_es and isinstance(product, dict):
+                            try:
+                                es_indexed += upsert_standard_products(
+                                    es,
+                                    settings.es_products_index,
+                                    [product],
+                                )
+                            except Exception as es_exc:
+                                err_console.print(
+                                    f"[yellow]ES upsert failed {pid}:[/yellow] {es_exc}"
+                                )
+                        if fetched % 20 == 0:
+                            console.print(
+                                f"… fetched {fetched} es={es_indexed} "
+                                f"quality={quality_kept} "
+                                f"interval≈{limiter.effective_interval:.2f}s "
+                                f"remaining_today≈{limiter.remaining_today}"
                             )
-                            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-                            fh.flush()
-                            fetched += 1
-                            done.add(pid)
-                            success = True
-                            product = row.get("product")
-                            if (
-                                quality_fh is not None
-                                and isinstance(product, dict)
-                                and product_meets_quality(product)
-                            ):
-                                quality_fh.write(
-                                    json.dumps(row, ensure_ascii=False) + "\n"
-                                )
-                                quality_fh.flush()
-                                quality_kept += 1
-                            if index_es and isinstance(product, dict):
-                                try:
-                                    es_indexed += upsert_standard_products(
-                                        es,
-                                        settings.es_products_index,
-                                        [product],
-                                    )
-                                except Exception as es_exc:
-                                    err_console.print(
-                                        f"[yellow]ES upsert failed {pid}:[/yellow] {es_exc}"
-                                    )
-                            if fetched % 20 == 0:
-                                console.print(
-                                    f"… fetched {fetched} es={es_indexed} "
-                                    f"quality={quality_kept} "
-                                    f"remaining_today≈{limiter.remaining_today}"
-                                )
-                        except (ValueError, IopError, Exception) as exc:
-                            limited, cool = _is_rate_limited(exc)
-                            if limited:
-                                err_console.print(
-                                    f"[yellow]Rate limited[/yellow] {exc}; cooling {cool:.0f}s"
-                                )
-                                limiter.penalize(cool)
-                                continue
-
-                            errors += 1
-                            row = {
-                                "ok": False,
-                                "product_id": pid,
-                                "url": item["url"],
-                                "error": str(exc),
-                                "fetched_at": datetime.now(timezone.utc).isoformat(),
-                            }
-                            if isinstance(exc, IopError) and exc.body is not None:
-                                row["error_body"] = exc.body
-                                row["raw"] = exc.body
-                            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-                            fh.flush()
-                            err_console.print(f"[red]{pid}[/red] {exc}")
-                            if _auth_fatal(str(exc)):
-                                err_console.print(
-                                    "[yellow]Stopping early due to auth/sign error.[/yellow]"
-                                )
-                                stop_all = True
-                            break
-
-                    if stop_all:
+                    except DailyQuotaExhausted as exc:
+                        err_console.print(f"[yellow]{exc}[/yellow]")
                         break
+                    except (ValueError, IopError, Exception) as exc:
+                        errors += 1
+                        row = {
+                            "ok": False,
+                            "product_id": pid,
+                            "url": item["url"],
+                            "error": str(exc),
+                            "fetched_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        if isinstance(exc, IopError) and exc.body is not None:
+                            row["error_body"] = exc.body
+                            row["raw"] = exc.body
+                        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        fh.flush()
+                        err_console.print(f"[red]{pid}[/red] {exc}")
+                        if _auth_fatal(str(exc)):
+                            err_console.print(
+                                "[yellow]Stopping early due to auth/sign error.[/yellow]"
+                            )
+                            break
 
                 if limit and fetched >= limit:
                     break
@@ -1305,12 +1274,13 @@ def queue_worker(
 
     q = get_product_queue(settings)
     es = make_es_client(settings) if index_es else None
-    service = ProductService()
+    iop = IopClient(limiter=limiter, max_retries=settings.aliexpress_max_retries)
+    service = ProductService(client=iop)
 
     console.print(
         f"Worker listening {settings.redis_queue_key} "
         f"(len={q.length()}) → ES={settings.es_products_index if index_es else 'off'} "
-        f"pace≥{interval:.2f}s daily≤{quota or '∞'}"
+        f"pace≥{interval:.2f}s daily≤{quota or '∞'} retries≤{settings.aliexpress_max_retries}"
     )
 
     fetched = 0
@@ -1346,93 +1316,74 @@ def queue_worker(
             "category": job.get("category") or job.get("categories"),
         }
 
-        success = False
-        stop_all = False
-        while not success:
-            try:
-                limiter.wait_turn()
-            except RuntimeError as exc:
-                err_console.print(f"[yellow]{exc}[/yellow]")
+        try:
+            summary = service.get_by_url(
+                url,
+                ship_to_country=country,
+                target_currency=currency,
+                target_language=language,
+                local_country=country,
+                local_language=language.lower(),
+            )
+            row = _write_product_row(
+                summary=summary,
+                item=item,
+                include_raw=include_raw,
+                ship_to_country=country,
+                fetch_shipping=settings.fetch_shipping_fee,
+                client=iop,
+            )
+            product = row.get("product")
+            if out_path is not None:
+                with out_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fetched += 1
+
+            if index_es and es is not None and isinstance(product, dict):
+                try:
+                    es_indexed += upsert_standard_products(
+                        es,
+                        settings.es_products_index,
+                        [product],
+                    )
+                except Exception as es_exc:
+                    err_console.print(
+                        f"[yellow]ES upsert failed {pid}:[/yellow] {es_exc}"
+                    )
+
+            price = product.get("price") if isinstance(product, dict) else None
+            console.print(
+                f"[green]ok[/green] {pid} price={price} "
+                f"es={es_indexed} interval≈{limiter.effective_interval:.2f}s "
+                f"remaining≈{limiter.remaining_today}"
+            )
+        except DailyQuotaExhausted as exc:
+            err_console.print(f"[yellow]{exc}[/yellow]")
+            if requeue_on_rate_limit:
+                q.requeue(job)
+                console.print(f"Requeued {pid} (daily quota)")
+            break
+        except (ValueError, IopError, Exception) as exc:
+            errors += 1
+            err_row = {
+                "ok": False,
+                "product_id": pid,
+                "url": url,
+                "error": str(exc),
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if isinstance(exc, IopError) and exc.body is not None:
+                err_row["error_body"] = exc.body
+            if out_path is not None:
+                with out_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(err_row, ensure_ascii=False) + "\n")
+            err_console.print(f"[red]{pid}[/red] {exc}")
+            if _auth_fatal(str(exc)):
                 if requeue_on_rate_limit:
                     q.requeue(job)
-                    console.print(f"Requeued {pid} (daily quota)")
-                stop_all = True
+                err_console.print("[yellow]Stopping due to auth/sign error.[/yellow]")
                 break
 
-            try:
-                summary = service.get_by_url(
-                    url,
-                    ship_to_country=country,
-                    target_currency=currency,
-                    target_language=language,
-                    local_country=country,
-                    local_language=language.lower(),
-                )
-                if settings.fetch_shipping_fee:
-                    limiter.wait_turn()
-                row = _write_product_row(
-                    summary=summary,
-                    item=item,
-                    include_raw=include_raw,
-                    ship_to_country=country,
-                    fetch_shipping=settings.fetch_shipping_fee,
-                )
-                product = row.get("product")
-                if out_path is not None:
-                    with out_path.open("a", encoding="utf-8") as fh:
-                        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-                fetched += 1
-                success = True
-
-                if index_es and es is not None and isinstance(product, dict):
-                    try:
-                        es_indexed += upsert_standard_products(
-                            es,
-                            settings.es_products_index,
-                            [product],
-                        )
-                    except Exception as es_exc:
-                        err_console.print(
-                            f"[yellow]ES upsert failed {pid}:[/yellow] {es_exc}"
-                        )
-
-                price = product.get("price") if isinstance(product, dict) else None
-                console.print(
-                    f"[green]ok[/green] {pid} price={price} "
-                    f"es={es_indexed} remaining≈{limiter.remaining_today}"
-                )
-            except (ValueError, IopError, Exception) as exc:
-                limited, cool = _is_rate_limited(exc)
-                if limited:
-                    err_console.print(
-                        f"[yellow]Rate limited[/yellow] {exc}; cooling {cool:.0f}s"
-                    )
-                    limiter.penalize(cool)
-                    continue
-
-                errors += 1
-                err_row = {
-                    "ok": False,
-                    "product_id": pid,
-                    "url": url,
-                    "error": str(exc),
-                    "fetched_at": datetime.now(timezone.utc).isoformat(),
-                }
-                if isinstance(exc, IopError) and exc.body is not None:
-                    err_row["error_body"] = exc.body
-                if out_path is not None:
-                    with out_path.open("a", encoding="utf-8") as fh:
-                        fh.write(json.dumps(err_row, ensure_ascii=False) + "\n")
-                err_console.print(f"[red]{pid}[/red] {exc}")
-                if _auth_fatal(str(exc)):
-                    if requeue_on_rate_limit:
-                        q.requeue(job)
-                    err_console.print("[yellow]Stopping due to auth/sign error.[/yellow]")
-                    stop_all = True
-                break
-
-        if stop_all:
-            break
         if once:
             break
         if max_jobs and fetched >= max_jobs:
