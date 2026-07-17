@@ -60,10 +60,13 @@ class Settings(BaseSettings):
     enqueue_category_blacklist: bool = True
     enqueue_category_blacklist_file: str = ""  # default: config/category_blacklist.yaml
 
-    # Product enrich on fetch (freight.calculate + categories)
-    fetch_shipping_fee: bool = True
+    # Optional enrich after product.get (off by default — crawl product detail first).
+    # freight.calculate = extra per-product API call.
+    # categories = resolve category_id → path via ES/tree (not a per-product API).
+    fetch_shipping_fee: bool = False
+    fetch_categories: bool = False
 
-    # asyncio queue-worker: parallel products, sequential APIs per product
+    # asyncio queue-worker: parallel products
     queue_concurrency: int = 1
 
     def require_queue_redis(self) -> None:

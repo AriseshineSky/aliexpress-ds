@@ -157,7 +157,8 @@ def _write_product_row(
     item: dict,
     include_raw: bool,
     ship_to_country: str = "US",
-    fetch_shipping: bool = True,
+    fetch_shipping: bool = False,
+    fetch_categories: bool = False,
     client=None,
 ) -> dict:
     from aliexpress_ds.enrich import enrich_product
@@ -169,14 +170,16 @@ def _write_product_row(
         url=item["url"],
         source=item.get("source") or item.get("es_source"),
     )
-    product = enrich_product(
-        product,
-        raw_payload=raw,
-        item=item,
-        ship_to_country=ship_to_country,
-        fetch_shipping=fetch_shipping,
-        client=client,
-    )
+    if fetch_shipping or fetch_categories:
+        product = enrich_product(
+            product,
+            raw_payload=raw,
+            item=item,
+            ship_to_country=ship_to_country,
+            fetch_shipping=fetch_shipping,
+            fetch_categories=fetch_categories,
+            client=client,
+        )
     row = {
         "ok": True,
         "product_id": product.get("product_id") or summary.product_id,
@@ -196,7 +199,8 @@ async def _awrite_product_row(
     item: dict,
     include_raw: bool,
     ship_to_country: str = "US",
-    fetch_shipping: bool = True,
+    fetch_shipping: bool = False,
+    fetch_categories: bool = False,
     client=None,
 ) -> dict:
     from aliexpress_ds.enrich import aenrich_product
@@ -208,14 +212,16 @@ async def _awrite_product_row(
         url=item["url"],
         source=item.get("source") or item.get("es_source"),
     )
-    product = await aenrich_product(
-        product,
-        raw_payload=raw,
-        item=item,
-        ship_to_country=ship_to_country,
-        fetch_shipping=fetch_shipping,
-        client=client,
-    )
+    if fetch_shipping or fetch_categories:
+        product = await aenrich_product(
+            product,
+            raw_payload=raw,
+            item=item,
+            ship_to_country=ship_to_country,
+            fetch_shipping=fetch_shipping,
+            fetch_categories=fetch_categories,
+            client=client,
+        )
     row = {
         "ok": True,
         "product_id": product.get("product_id") or summary.product_id,
@@ -836,6 +842,7 @@ def fetch_es(
                             include_raw=include_raw,
                             ship_to_country=country,
                             fetch_shipping=settings.fetch_shipping_fee,
+                            fetch_categories=settings.fetch_categories,
                             client=iop,
                         )
                         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -1254,8 +1261,8 @@ def queue_worker(
         -1,
         "--concurrency",
         "-j",
-        help="Parallel products (asyncio). <0 uses QUEUE_CONCURRENCY (default 3). "
-        "Each product still runs product.get → freight sequentially.",
+        help="Parallel products (asyncio). <0 uses QUEUE_CONCURRENCY. "
+        "Default: product.get only; enable FETCH_SHIPPING_FEE for freight after.",
     ),
     once: bool = typer.Option(
         False,
@@ -1290,10 +1297,10 @@ def queue_worker(
         help="Put job back on queue when daily quota / hard rate limit stops work",
     ),
 ) -> None:
-    """Listen on Redis queue → DS product.get (+ freight) → upsert ES.
+    """Listen on Redis queue → DS product.get → upsert ES.
 
-    Uses asyncio: N products in parallel, shared RateLimiter; APIs for one
-    product stay sequential (freight needs product.get SKU/price).
+    Uses asyncio: N products in parallel, shared RateLimiter.
+    Optional FETCH_SHIPPING_FEE / FETCH_CATEGORIES enrich after product.get.
     """
     import asyncio
 
@@ -1371,7 +1378,7 @@ def queue_worker(
             }
 
             try:
-                # Per product: product.get then freight (sequential).
+                # product.get only by default; optional freight/categories via settings.
                 summary = await service.aget_by_url(
                     url,
                     ship_to_country=country,
@@ -1386,6 +1393,7 @@ def queue_worker(
                     include_raw=include_raw,
                     ship_to_country=country,
                     fetch_shipping=settings.fetch_shipping_fee,
+                    fetch_categories=settings.fetch_categories,
                     client=iop,
                 )
                 product = row.get("product")

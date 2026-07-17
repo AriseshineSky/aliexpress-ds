@@ -1,4 +1,11 @@
-"""Post-process StandardProduct with freight + categories."""
+"""Optional post-process: freight + categories (separate from product.get).
+
+product.get already returns category_id; resolving the breadcrumb path is a
+local/ES lookup (or a one-shot category tree API if ES is empty) — not a
+per-product DS request. freight.calculate is a separate per-product API call.
+
+Both steps are off by default so crawl quota goes to product detail first.
+"""
 
 from __future__ import annotations
 
@@ -52,27 +59,32 @@ def enrich_product(
     raw_payload: dict[str, Any],
     item: dict[str, Any] | None = None,
     ship_to_country: str = "US",
-    fetch_shipping: bool = True,
+    fetch_shipping: bool = False,
+    fetch_categories: bool = False,
     client: IopClient | None = None,
 ) -> dict[str, Any]:
-    """Fill shipping_fee and categories on an already-mapped product dict."""
+    """Optionally fill shipping_fee and/or categories on a mapped product dict."""
+    if not fetch_shipping and not fetch_categories:
+        return product
+
     item = item or {}
     result = dig_result(raw_payload)
     base = result.get("ae_item_base_info_dto") or {}
     if not isinstance(base, dict):
         base = {}
 
-    category_id = str(base.get("category_id") or "").strip() or None
-    fallback = item.get("category") or item.get("categories")
-    if not fallback:
-        pid = str(product.get("product_id") or base.get("product_id") or "").strip()
-        fallback = _urls_category_fallback(pid, item.get("source") or product.get("source"))
-    categories = resolve_categories(
-        category_id=category_id,
-        fallback_category=fallback,
-    )
-    if categories:
-        product["categories"] = categories
+    if fetch_categories:
+        category_id = str(base.get("category_id") or "").strip() or None
+        fallback = item.get("category") or item.get("categories")
+        if not fallback:
+            pid = str(product.get("product_id") or base.get("product_id") or "").strip()
+            fallback = _urls_category_fallback(pid, item.get("source") or product.get("source"))
+        categories = resolve_categories(
+            category_id=category_id,
+            fallback_category=fallback,
+        )
+        if categories:
+            product["categories"] = categories
 
     if fetch_shipping:
         pid = str(product.get("product_id") or base.get("product_id") or "").strip()
@@ -95,27 +107,32 @@ async def aenrich_product(
     raw_payload: dict[str, Any],
     item: dict[str, Any] | None = None,
     ship_to_country: str = "US",
-    fetch_shipping: bool = True,
+    fetch_shipping: bool = False,
+    fetch_categories: bool = False,
     client: IopClient | None = None,
 ) -> dict[str, Any]:
     """Async enrich: categories sync, freight via execute_async (after product.get)."""
+    if not fetch_shipping and not fetch_categories:
+        return product
+
     item = item or {}
     result = dig_result(raw_payload)
     base = result.get("ae_item_base_info_dto") or {}
     if not isinstance(base, dict):
         base = {}
 
-    category_id = str(base.get("category_id") or "").strip() or None
-    fallback = item.get("category") or item.get("categories")
-    if not fallback:
-        pid = str(product.get("product_id") or base.get("product_id") or "").strip()
-        fallback = _urls_category_fallback(pid, item.get("source") or product.get("source"))
-    categories = resolve_categories(
-        category_id=category_id,
-        fallback_category=fallback,
-    )
-    if categories:
-        product["categories"] = categories
+    if fetch_categories:
+        category_id = str(base.get("category_id") or "").strip() or None
+        fallback = item.get("category") or item.get("categories")
+        if not fallback:
+            pid = str(product.get("product_id") or base.get("product_id") or "").strip()
+            fallback = _urls_category_fallback(pid, item.get("source") or product.get("source"))
+        categories = resolve_categories(
+            category_id=category_id,
+            fallback_category=fallback,
+        )
+        if categories:
+            product["categories"] = categories
 
     if fetch_shipping:
         pid = str(product.get("product_id") or base.get("product_id") or "").strip()
