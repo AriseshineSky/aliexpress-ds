@@ -10,6 +10,7 @@ SSH=(ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
 RSYNC=(rsync -az --delete
   --exclude .venv
   --exclude .git
+  --exclude .env
   --exclude __pycache__
   --exclude '*.pyc'
   --exclude data/*.jsonl
