@@ -27,9 +27,22 @@ MEMORY_CACHE_MAX_AGE = timedelta(minutes=10)
 
 _redis_clients: dict[str, Any] = {}
 _redis_lock = threading.Lock()
-# redis_url (or "__env__") → (cached_at_monotonic, token_dict)
+# redis_url+app_key (or "__env__") → (cached_at_monotonic, token_dict)
 _token_memory: dict[str, tuple[float, dict[str, Any]]] = {}
 _token_memory_lock = threading.Lock()
+
+
+def redis_token_key(settings: Settings | None = None) -> str:
+    """Per-app Redis key so multiple AppKeys can share one Upstash without clobbering.
+
+    Prefers ``aliexpress:oauth:token:{app_key}``; legacy single-app installs still
+    use ``aliexpress:oauth:token``.
+    """
+    settings = settings or get_settings()
+    app_key = (settings.aliexpress_app_key or "").strip()
+    if app_key and not app_key.startswith("your_"):
+        return f"{REDIS_TOKEN_KEY}:{app_key}"
+    return REDIS_TOKEN_KEY
 
 
 def _redis_client(url: str):
@@ -55,7 +68,8 @@ def _redis_client(url: str):
 
 def _cache_key(settings: Settings) -> str:
     url = (settings.redis_url or "").strip()
-    return url or "__env__"
+    app = (settings.aliexpress_app_key or "").strip()
+    return f"{url or '__env__'}|{app}"
 
 
 def _memory_get(settings: Settings) -> dict[str, Any] | None:
@@ -95,17 +109,32 @@ def load_token_from_redis(settings: Settings | None = None) -> dict[str, Any] | 
         return None
 
     client = _redis_client(url)
-    raw = client.get(REDIS_TOKEN_KEY)
-    if not raw:
-        return None
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
-    data = json.loads(raw)
-    return data if isinstance(data, dict) else None
+    primary = redis_token_key(settings)
+    candidates = [primary]
+    if primary != REDIS_TOKEN_KEY:
+        candidates.append(REDIS_TOKEN_KEY)
+
+    for key in candidates:
+        raw = client.get(key)
+        if not raw:
+            continue
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and str(data.get("access_token") or "").strip():
+            if key != primary:
+                logger.info("Loaded OAuth token from legacy Redis key %s (prefer %s)", key, primary)
+            else:
+                logger.debug("Loaded OAuth token from Redis %s", key)
+            return data
+    return None
 
 
 def save_token_to_redis(payload: dict[str, Any], settings: Settings | None = None) -> None:
-    """Persist token JSON to Upstash (same key as aliexpress-oauth TokenStore)."""
+    """Persist token JSON to Upstash (per-app key; also mirrors legacy key for one-app setups)."""
     settings = settings or get_settings()
     url = (settings.redis_url or "").strip()
     if not url:
@@ -115,16 +144,24 @@ def save_token_to_redis(payload: dict[str, Any], settings: Settings | None = Non
     body["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if "id" not in body:
         body["id"] = "redis"
+    app_key = (settings.aliexpress_app_key or "").strip()
+    if app_key and not app_key.startswith("your_"):
+        body.setdefault("app_key", app_key)
 
     ttl = _ttl_seconds(body)
     client = _redis_client(url)
-    client.set(REDIS_TOKEN_KEY, json.dumps(body, ensure_ascii=False))
+    primary = redis_token_key(settings)
+    blob = json.dumps(body, ensure_ascii=False)
+    client.set(primary, blob)
     if ttl > 0:
-        client.expire(REDIS_TOKEN_KEY, ttl)
+        client.expire(primary, ttl)
+    # Keep legacy key in sync only when this is the sole/default app key write
+    # and primary is already the legacy key, or when primary is app-specific we
+    # do NOT overwrite legacy (avoids clobbering the other app).
     _memory_put(settings, body)
     logger.info(
         "Saved token to Redis %s (expires_at=%s ttl=%ss)",
-        REDIS_TOKEN_KEY,
+        primary,
         body.get("expires_at"),
         ttl,
     )
@@ -326,7 +363,7 @@ def resolve_access_token(settings: Settings | None = None) -> str:
             data = ensure_fresh_token(settings)
             token = str(data.get("access_token") or "").strip()
             if token:
-                logger.debug("Using access_token from Redis (%s)", REDIS_TOKEN_KEY)
+                logger.debug("Using access_token from Redis (%s)", redis_token_key(settings))
                 return token
         except ValueError as exc:
             logger.warning("Redis token unavailable: %s", exc)

@@ -50,7 +50,11 @@ uv run aliexpress-ds fetch-es -n 100 --index-es
 ## Notes
 
 - Homepage calp tabs (`categoryTab=…`) and DS `category_id` are different taxonomies.
-  `sync-categories` best-effort maps L1 names → `ds_category_id` for later `discover-feed -C`.
+  `sync-categories` best-effort maps L1 names → `ds_category_id` for later `discover-feed -C`
+  / `discover-search -C`.
+- **Keyword mass discovery**: `aliexpress-ds discover-search` uses official
+  `aliexpress.ds.text.search` (same urls index as link-crawler). Auto-generates
+  keywords from category leaves + modifiers; optional `--enqueue` to Redis.
 - Link-crawler falls back to YAML local queue if `CATEGORY_CLAIM_MODE=0` or ES categories unavailable.
 - Listing pages sometimes expose a total count (API/`N results`); stored as `listing_total` when found. Calp infinite scroll does not always publish a reliable total.
-- DS does **not** replace browser URL discovery for 200k scale; it supplies structure + optional feed discovery.
+- DS Search/Feed supplement browser URL discovery; they do not replace calp crawl for every surface.

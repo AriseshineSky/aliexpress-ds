@@ -211,12 +211,23 @@ def upsert_url_docs(
         return 0
     resp = es.bulk(operations=actions, refresh=False)
     if resp.get("errors"):
-        # Count successes; ignore per-item conflicts for seed URLs
+        # Count successes; surface first mapper/error so silent 0 isn't mysterious
         ok = 0
+        first_err: str | None = None
         for item in resp.get("items") or []:
             idx = item.get("index") or {}
             if idx.get("status") in (200, 201):
                 ok += 1
+                continue
+            if first_err is None:
+                err = idx.get("error") or {}
+                first_err = (
+                    f"{err.get('type')}: {err.get('reason')}"
+                    if isinstance(err, dict)
+                    else str(err)
+                )
+        if ok == 0 and first_err:
+            raise RuntimeError(f"ES urls bulk failed (0/{len(actions)//2}): {first_err}")
         return ok
     return len(actions) // 2
 

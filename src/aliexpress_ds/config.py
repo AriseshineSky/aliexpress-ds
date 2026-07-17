@@ -39,11 +39,10 @@ class Settings(BaseSettings):
     es_categories_index: str = "user1_aliexpress_ds_categories"
     es_crawl_categories_index: str = "user1_aliexpress_crawl_categories"
 
-    # Official limits (Beijing GMT+8). Test/formal-test = 5,000/day/app.
-    # Online: match Console package (e.g. 100000). 0 = no local daily cap.
-    # QPS is not a single published number for DS APIs — pace proactively and
-    # back off using response ban seconds (ApiCallLimits / App Call Limited).
-    aliexpress_daily_limit: int = 5000
+    # LOCAL client-side daily cap only (Beijing GMT+8). Not returned by API on success.
+    # Match Console 管理证书, or 0 = no local daily stop (platform errors still apply).
+    # QPS / AppApiCallLimit ban seconds come only from error responses.
+    aliexpress_daily_limit: int = 100000
     aliexpress_min_interval_sec: float = 1.0  # ~1 QPS; adaptive up on AppApiCallLimit
     aliexpress_max_retries: int = 6  # flow-control / transport retries per call
 

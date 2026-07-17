@@ -1,20 +1,27 @@
 """AliExpress Open Platform call pacing + flow-control parsing.
 
-Official rules (see README / Open Platform docs):
+Use AliExpress Open Service docs/console (not Taobao TOP 流量包 FAQ):
 
-1. Per AppKey daily quota (Beijing GMT+8). Test/formal-test = 5,000/day.
-   Online apps: category-dependent (check Console). Exhaustion lasts until 24:00 GMT+8.
+- Console: https://openservice.aliexpress.com/app/index.htm
+- Docs: https://openservice.aliexpress.com/doc/doc.htm (DropShippers API Developer)
+- DS product.get current limiting (community):
+  https://openservice.aliexpress.com/dada/community/index.htm?#/article-detail/1901
+
+Limit kinds we handle from API **error** bodies (success responses have no quota fields):
+
+1. Per AppKey daily quota (Beijing GMT+8) — match Console package; local
+   ``ALIEXPRESS_DAILY_LIMIT`` is client-side only.
    Sub-code: ``accesscontrol.limited-by-app-access-count``
 
-2. Per-API QPS / minute caps (all apps). Response often includes
+2. Per-API QPS / minute caps. Often includes
    ``This ban will last for N more seconds`` / ``ApiCallLimits``.
    Sub-code: ``accesscontrol.limited-by-api-access-count``
 
-3. Per AppKey+API (common for unreleased apps).
+3. Per AppKey+API frequency — common in practice as ``AppApiCallLimit``
+   (``The frequency of app access to the api exceeds the limit``).
    Sub-code: ``accesscontrol.limited-by-app-api-access-count``
 
-Error code ``7`` / ``App Call Limited`` covers the above. Wait the ban window,
-then retry; do not hammer the API while banned.
+Wait the ban window from the error message; do not hammer while banned.
 """
 
 from __future__ import annotations
@@ -56,6 +63,7 @@ class FlowControl:
     cooldown_sec: float
     stop_for_day: bool = False
     sub_code: str = ""
+    message: str = ""
 
 
 class DailyQuotaExhausted(RuntimeError):
@@ -103,6 +111,7 @@ def parse_flow_control(exc: BaseException) -> FlowControl | None:
     blob = _exc_blob(exc)
     code = str(getattr(exc, "code", "") or "").strip()
     code_l = code.lower()
+    msg = str(exc)[:500]
 
     markers = (
         "apicalllimits",
@@ -135,6 +144,7 @@ def parse_flow_control(exc: BaseException) -> FlowControl | None:
             cooldown_sec=seconds_until_beijing_midnight(),
             stop_for_day=True,
             sub_code="accesscontrol.limited-by-app-access-count",
+            message=msg,
         )
     # App+API frequency (common Online): code AppApiCallLimit
     # msg e.g. "The frequency of app access to the api exceeds the limit.
@@ -148,20 +158,25 @@ def parse_flow_control(exc: BaseException) -> FlowControl | None:
             FlowKind.APP_API,
             cooldown_sec=max(ban, 1.0),
             sub_code=code or "AppApiCallLimit",
+            message=msg,
         )
     if "limited-by-api-access-count" in blob or "apicalllimits" in blob:
         return FlowControl(
             FlowKind.API_QPS,
             cooldown_sec=max(ban, 1.0),
             sub_code=code or "accesscontrol.limited-by-api-access-count",
+            message=msg,
         )
     if "app call limited" in blob or code == "7":
         return FlowControl(
             FlowKind.UNKNOWN,
             cooldown_sec=max(ban, 60.0 if ban <= 1.0 else ban),
             sub_code=code or "7",
+            message=msg,
         )
-    return FlowControl(FlowKind.UNKNOWN, cooldown_sec=max(ban, 1.0), sub_code=code)
+    return FlowControl(
+        FlowKind.UNKNOWN, cooldown_sec=max(ban, 1.0), sub_code=code, message=msg
+    )
 
 
 class RateLimiter:
@@ -183,6 +198,7 @@ class RateLimiter:
         self._effective_interval = self.base_interval_sec
         self.daily_limit = max(0, int(daily_limit))
         self.state_path = state_path or Path("data/rate_limit_state.json")
+        self.platform_state_path = self.state_path.parent / "platform_rate_limit.json"
         self._lock = threading.Lock()
         self._async_lock: asyncio.Lock | None = None
         self._last_call_at = 0.0
@@ -310,6 +326,30 @@ class RateLimiter:
                 with self._lock:
                     self._last_call_at = time.monotonic()
 
+    def _save_platform_signal(self, fc: FlowControl, cool: float) -> None:
+        """Persist last platform-reported limit (only present on error responses)."""
+        payload = {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "beijing_day": datetime.now(BEIJING).strftime("%Y-%m-%d"),
+            "kind": fc.kind.value,
+            "sub_code": fc.sub_code or "",
+            "ban_seconds": cool,
+            "stop_for_day": fc.stop_for_day,
+            "message": (fc.message or "")[:500],
+            "note": (
+                "Successful AE API responses do not include remaining daily quota. "
+                "This file only records the last flow-control error body."
+            ),
+        }
+        try:
+            self.platform_state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.platform_state_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.debug("Could not write platform rate signal: %s", exc)
+
     def _arm_flow_control(self, fc: FlowControl) -> float:
         cool = max(0.0, float(fc.cooldown_sec))
         with self._lock:
@@ -337,6 +377,7 @@ class RateLimiter:
                     self.base_interval_sec = new_base
                     self.min_interval_sec = new_base
                     self._effective_interval = max(self._effective_interval, new_base)
+            self._save_platform_signal(fc, cool)
             logger.warning(
                 "Flow control kind=%s sub=%s sleep=%.1fs interval→%.2fs base=%.2fs",
                 fc.kind.value,
@@ -377,8 +418,14 @@ def describe_limits(*, daily_limit: int, min_interval: float) -> dict[str, Any]:
         "approx_qps": (1.0 / min_interval) if min_interval > 0 else "unlimited",
         "beijing_day": datetime.now(BEIJING).strftime("%Y-%m-%d"),
         "docs": {
+            # AliExpress Open Service (not Taobao TOP 管理证书 FAQ)
+            "console": "https://openservice.aliexpress.com/app/index.htm",
+            "docs_home": "https://openservice.aliexpress.com/doc/doc.htm",
+            "ds_product_get_current_limiting": (
+                "https://openservice.aliexpress.com/dada/community/index.htm?#/article-detail/1901"
+            ),
+            "support": "https://openservice.aliexpress.com/support/index.htm",
+            # Historical AE English note (hosted on alitrip domain)
             "access_count": "https://open.alitrip.com/docs/doc.htm?articleId=108426&docType=1",
-            "app_call_limited": "https://developer.alibaba.com/docs/doc.htm?articleId=108869&docType=1",
-            "environments": "https://open.fliggy.com/docs/doc.htm?articleId=108101&docType=1",
         },
     }

@@ -2,10 +2,41 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import sys
+import time
 from typing import Any
 
 from aliexpress_ds.config import Settings, get_settings
+
+log = logging.getLogger(__name__)
+
+# Cap wait between Redis reconnect retries (seconds).
+_REDIS_RETRY_MAX_DELAY = 60.0
+
+
+def _redis_client_kwargs(url: str) -> dict[str, Any]:
+    """Shared redis-py kwargs. protocol=2 for Redis <6 (no HELLO).
+
+    socket_timeout=None so BRPOP's server-side wait is not cut short by the
+    client socket deadline (which previously surfaced as TimeoutError and
+    crashed queue-worker under systemd Restart=always).
+    """
+    kwargs: dict[str, Any] = {
+        "decode_responses": True,
+        "protocol": 2,
+        "socket_timeout": None,
+        "socket_connect_timeout": 10,
+        "retry_on_timeout": True,
+        "health_check_interval": 30,
+    }
+    if url.startswith("rediss://"):
+        import ssl
+
+        kwargs["ssl_cert_reqs"] = ssl.CERT_NONE
+    return kwargs
 
 
 def _redis_client(url: str):
@@ -14,12 +45,25 @@ def _redis_client(url: str):
     except ImportError as exc:
         raise RuntimeError("redis package missing; run: uv add redis") from exc
 
-    kwargs: dict[str, Any] = {"decode_responses": True, "protocol": 2}
-    if url.startswith("rediss://"):
-        import ssl
+    return redis_lib.from_url(url, **_redis_client_kwargs(url))
 
-        kwargs["ssl_cert_reqs"] = ssl.CERT_NONE
-    return redis_lib.from_url(url, **kwargs)
+
+def _is_redis_transient(exc: BaseException) -> bool:
+    """True for timeouts / disconnects that should wait-and-retry."""
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError, asyncio.TimeoutError)):
+        return True
+    try:
+        from redis.exceptions import ConnectionError as RedisConnectionError
+        from redis.exceptions import TimeoutError as RedisTimeoutError
+    except ImportError:
+        return False
+    return isinstance(exc, (RedisTimeoutError, RedisConnectionError))
+
+
+def _log_redis_retry(op: str, exc: BaseException, delay: float) -> None:
+    msg = f"Redis {op} failed ({type(exc).__name__}: {exc}); retry in {delay:.0f}s"
+    log.warning(msg)
+    print(msg, file=sys.stderr, flush=True)
 
 
 class ProductQueue:
@@ -30,16 +74,34 @@ class ProductQueue:
         url = (self.settings.redis_queue_url or "").strip()
         if not url:
             raise ValueError("REDIS_QUEUE_URL is not set")
+        self._url = url
         self.client = _redis_client(url)
         self.queue_key = self.settings.redis_queue_key
         self.seen_key = self.settings.redis_queue_seen_key
         self.brpop_timeout = max(1, int(self.settings.redis_queue_brpop_timeout))
 
+    def _reconnect(self) -> None:
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self.client = _redis_client(self._url)
+
     def ping(self) -> str:
         return str(self.client.ping())
 
     def length(self) -> int:
-        return int(self.client.llen(self.queue_key))
+        delay = 1.0
+        while True:
+            try:
+                return int(self.client.llen(self.queue_key))
+            except Exception as exc:
+                if not _is_redis_transient(exc):
+                    raise
+                _log_redis_retry("LLEN", exc, delay)
+                self._reconnect()
+                time.sleep(delay)
+                delay = min(_REDIS_RETRY_MAX_DELAY, delay * 2)
 
     def seen_count(self) -> int:
         return int(self.client.scard(self.seen_key))
@@ -111,13 +173,27 @@ class ProductQueue:
         return new, skipped
 
     def blocking_pop(self, timeout: int | None = None) -> dict[str, Any] | None:
-        """BRPOP one job. Returns decoded job dict or None on timeout."""
+        """BRPOP one job. Returns decoded job dict or None on empty-queue timeout.
+
+        Transient Redis timeouts/disconnects wait-and-retry (reconnect) instead
+        of raising — queue-worker must stay up under flaky network.
+        """
         to = self.brpop_timeout if timeout is None else max(1, int(timeout))
-        result = self.client.brpop(self.queue_key, timeout=to)
-        if not result:
-            return None
-        _key, raw = result
-        return self.decode_job(raw)
+        delay = 1.0
+        while True:
+            try:
+                result = self.client.brpop(self.queue_key, timeout=to)
+                if not result:
+                    return None
+                _key, raw = result
+                return self.decode_job(raw)
+            except Exception as exc:
+                if not _is_redis_transient(exc):
+                    raise
+                _log_redis_retry("BRPOP", exc, delay)
+                self._reconnect()
+                time.sleep(delay)
+                delay = min(_REDIS_RETRY_MAX_DELAY, delay * 2)
 
     def requeue(self, job: dict[str, Any]) -> None:
         pid = str(job.get("product_id") or "").strip()
@@ -199,45 +275,84 @@ class AsyncProductQueue:
         url = (self.settings.redis_queue_url or "").strip()
         if not url:
             raise ValueError("REDIS_QUEUE_URL is not set")
-        kwargs: dict[str, Any] = {"decode_responses": True, "protocol": 2}
-        if url.startswith("rediss://"):
-            import ssl
-
-            kwargs["ssl_cert_reqs"] = ssl.CERT_NONE
-        self.client = redis_async.from_url(url, **kwargs)
+        self._url = url
+        self._kwargs = _redis_client_kwargs(url)
+        self._redis_async = redis_async
+        self.client = redis_async.from_url(url, **self._kwargs)
         self.queue_key = self.settings.redis_queue_key
         self.seen_key = self.settings.redis_queue_seen_key
         self.brpop_timeout = max(1, int(self.settings.redis_queue_brpop_timeout))
 
+    async def _reconnect(self) -> None:
+        try:
+            await self.client.aclose()
+        except Exception:
+            pass
+        self.client = self._redis_async.from_url(self._url, **self._kwargs)
+
     async def length(self) -> int:
-        return int(await self.client.llen(self.queue_key))
+        delay = 1.0
+        while True:
+            try:
+                return int(await self.client.llen(self.queue_key))
+            except Exception as exc:
+                if not _is_redis_transient(exc):
+                    raise
+                _log_redis_retry("LLEN", exc, delay)
+                await self._reconnect()
+                await asyncio.sleep(delay)
+                delay = min(_REDIS_RETRY_MAX_DELAY, delay * 2)
 
     async def blocking_pop(self, timeout: int | None = None) -> dict[str, Any] | None:
+        """BRPOP one job. Returns decoded job or None on empty-queue timeout.
+
+        Transient Redis timeouts/disconnects wait-and-retry (reconnect) instead
+        of raising — keeps systemd queue-worker from crash-looping.
+        """
         to = self.brpop_timeout if timeout is None else max(1, int(timeout))
-        result = await self.client.brpop(self.queue_key, timeout=to)
-        if not result:
-            return None
-        _key, raw = result
-        return ProductQueue.decode_job(raw)
+        delay = 1.0
+        while True:
+            try:
+                result = await self.client.brpop(self.queue_key, timeout=to)
+                if not result:
+                    return None
+                _key, raw = result
+                return ProductQueue.decode_job(raw)
+            except Exception as exc:
+                if not _is_redis_transient(exc):
+                    raise
+                _log_redis_retry("BRPOP", exc, delay)
+                await self._reconnect()
+                await asyncio.sleep(delay)
+                delay = min(_REDIS_RETRY_MAX_DELAY, delay * 2)
 
     async def requeue(self, job: dict[str, Any]) -> None:
         pid = str(job.get("product_id") or "").strip()
         if not pid:
             return
-        await self.client.lpush(
-            self.queue_key,
-            ProductQueue._encode_job(
-                pid,
-                url=job.get("url"),
-                source=job.get("source"),
-                extra={
-                    k: v
-                    for k, v in job.items()
-                    if k not in ("product_id", "url", "source") and v is not None
-                }
-                or None,
-            ),
+        delay = 1.0
+        payload = ProductQueue._encode_job(
+            pid,
+            url=job.get("url"),
+            source=job.get("source"),
+            extra={
+                k: v
+                for k, v in job.items()
+                if k not in ("product_id", "url", "source") and v is not None
+            }
+            or None,
         )
+        while True:
+            try:
+                await self.client.lpush(self.queue_key, payload)
+                return
+            except Exception as exc:
+                if not _is_redis_transient(exc):
+                    raise
+                _log_redis_retry("LPUSH", exc, delay)
+                await self._reconnect()
+                await asyncio.sleep(delay)
+                delay = min(_REDIS_RETRY_MAX_DELAY, delay * 2)
 
     async def aclose(self) -> None:
         await self.client.aclose()

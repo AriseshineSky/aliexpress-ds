@@ -361,7 +361,8 @@ class IopClient:
         payload = body.get(response_key, body)
 
         code = str(payload.get("code") or payload.get("rsp_code") or "0")
-        if code not in {"0", "200", ""}:
+        # AE DS sometimes returns "00" / "000" as success (e.g. text.search).
+        if code not in {"0", "00", "000", "200", ""}:
             raise IopError(
                 payload.get("message") or payload.get("rsp_msg") or "API business error",
                 code=code,

@@ -332,6 +332,10 @@ def config_check() -> None:
     console.print(f"app_key={settings.aliexpress_app_key}")
     console.print(f"api_url={settings.aliexpress_api_url}")
     console.print(f"oauth_redis={'yes' if settings.redis_url else 'no'}")
+    if settings.redis_url:
+        from aliexpress_ds.token_store import redis_token_key
+
+        console.print(f"oauth_token_key={redis_token_key(settings)}")
     console.print(f"queue_redis={'yes' if settings.redis_queue_url else 'no'}")
     console.print(f"token=…{token[-6:]}")
     if data:
@@ -618,6 +622,288 @@ def discover_feed(
 
     console.print(
         f"[green]Done[/green] discovered={len(docs)} es_indexed={indexed} → {output}"
+    )
+
+
+@app.command("discover-search")
+def discover_search(
+    category_id: Optional[str] = typer.Option(
+        None,
+        "--category-id",
+        "-C",
+        help="DS category_id to search within (from `categories` / sync-categories)",
+    ),
+    category_name: Optional[str] = typer.Option(
+        None,
+        "--category-name",
+        "-N",
+        help="Match category by name/path substring if id unknown (e.g. 'Beauty')",
+    ),
+    keyword: Optional[list[str]] = typer.Option(
+        None,
+        "--keyword",
+        "-k",
+        help="Explicit keyword (repeatable). If omitted, auto-generate from category tree",
+    ),
+    keywords_file: Optional[Path] = typer.Option(
+        None,
+        "--keywords-file",
+        help="One keyword per line (# comments ok)",
+    ),
+    selection_name: Optional[str] = typer.Option(
+        None,
+        "--selection-name",
+        help="Optional DS selection pool name (search within that selection)",
+    ),
+    max_keywords: int = typer.Option(
+        40,
+        "--max-keywords",
+        help="Cap auto-generated keywords (mass discovery)",
+    ),
+    max_leaves: int = typer.Option(
+        60,
+        "--max-leaves",
+        help="How many child category leaves to expand into keywords",
+    ),
+    pages: int = typer.Option(
+        5,
+        "--pages",
+        "-p",
+        help="Max pages per keyword",
+    ),
+    page_size: int = typer.Option(20, "--page-size", help="1-50"),
+    sort_by: str = typer.Option(
+        "orders,desc",
+        "--sort-by",
+        help="min_price/orders/comments + ,asc|,desc",
+    ),
+    country: str = typer.Option("US", "--country", "-c"),
+    local: str = typer.Option("en_US", "--local"),
+    currency: str = typer.Option("USD", "--currency"),
+    write_es: bool = typer.Option(
+        True,
+        "--write-es/--no-write-es",
+        help="Upsert into ES_URLS_INDEX (same as link-crawler seeds)",
+    ),
+    enqueue: bool = typer.Option(
+        False,
+        "--enqueue/--no-enqueue",
+        help="Also LPUSH product_ids into Redis queue for queue-worker",
+    ),
+    dry_run_keywords: bool = typer.Option(
+        False,
+        "--dry-run-keywords",
+        help="Only print generated keywords and exit",
+    ),
+    output: Path = typer.Option(
+        Path("data/discovered_search_urls.jsonl"),
+        "--output",
+        "-o",
+    ),
+) -> None:
+    """Discover product_ids via aliexpress.ds.text.search (keyword + category).
+
+    Like link-crawler URL scrape, but through the official DS Search API:
+    pick a category directory, auto-generate keywords (or pass your own),
+    paginate results → ES urls index (and optional Redis queue).
+    """
+    from aliexpress_ds.categories import CategoryService, flatten_category_tree
+    from aliexpress_ds.keywords import (
+        keywords_from_category_rows,
+        keywords_from_names,
+        load_keywords_file,
+    )
+    from aliexpress_ds.rate_limit import RateLimiter
+    from aliexpress_ds.search import (
+        TextService,
+        extract_search_products,
+        search_product_to_url_doc,
+    )
+
+    settings = get_settings()
+    try:
+        settings.require_credentials()
+        if write_es or category_name:
+            settings.require_es()
+        if enqueue:
+            settings.require_queue_redis()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    limiter = RateLimiter(
+        min_interval_sec=settings.aliexpress_min_interval_sec,
+        daily_limit=settings.aliexpress_daily_limit,
+        state_path=Path("data/rate_limit_state.json"),
+    )
+    iop = IopClient(limiter=limiter)
+    cats = CategoryService(client=iop)
+    text_svc = TextService(client=iop)
+
+    # Resolve category tree for keyword expansion / name → id
+    console.print("Loading DS category tree …")
+    try:
+        tree_payload = cats.fetch_raw()
+    except (ValueError, IopError, DailyQuotaExhausted, RuntimeError) as exc:
+        err_console.print(f"[red]category.get failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    rows = flatten_category_tree(tree_payload)
+
+    resolved_id = str(category_id or "").strip() or None
+    category_path: str | None = None
+    if not resolved_id and category_name:
+        needle = category_name.strip().lower()
+        matches = [
+            r
+            for r in rows
+            if needle in str(r.get("path") or "").lower()
+            or needle in str(r.get("category_name") or "").lower()
+        ]
+        matches.sort(key=lambda r: (int(r.get("level") or 99), str(r.get("path") or "")))
+        if not matches:
+            err_console.print(f"[red]No category matches[/red] name={category_name!r}")
+            raise typer.Exit(code=1)
+        resolved_id = str(matches[0]["category_id"])
+        category_path = str(matches[0].get("path") or "")
+        console.print(
+            f"Matched category [cyan]{category_path}[/cyan] id={resolved_id} "
+            f"(from {len(matches)} hits)"
+        )
+    elif resolved_id:
+        for r in rows:
+            if str(r.get("category_id")) == resolved_id:
+                category_path = str(r.get("path") or "")
+                break
+
+    # Build keyword list
+    keywords: list[str] = []
+    if keyword:
+        keywords.extend(k.strip() for k in keyword if k and k.strip())
+    if keywords_file is not None:
+        keywords.extend(load_keywords_file(str(keywords_file)))
+    if not keywords:
+        if not resolved_id and not category_name:
+            err_console.print(
+                "[red]Need --keyword / --keywords-file and/or --category-id / --category-name[/red]"
+            )
+            raise typer.Exit(code=1)
+        if resolved_id:
+            keywords = keywords_from_category_rows(
+                rows,
+                parent_category_id=resolved_id,
+                max_leaves=max_leaves,
+            )
+        else:
+            keywords = keywords_from_names([category_name or ""])
+        keywords = keywords[: max(1, int(max_keywords))]
+
+    # de-dupe preserve order
+    seen_kw: set[str] = set()
+    uniq_kw: list[str] = []
+    for kw in keywords:
+        k = kw.strip().lower()
+        if not k or k in seen_kw:
+            continue
+        seen_kw.add(k)
+        uniq_kw.append(k)
+    keywords = uniq_kw
+
+    console.print(
+        f"Keywords={len(keywords)} category_id={resolved_id or '-'} "
+        f"path={category_path or '-'} selection={selection_name or '-'} "
+        f"pages≤{pages} page_size={page_size}"
+    )
+    for i, kw in enumerate(keywords[:30], 1):
+        console.print(f"  {i:3}. {kw}")
+    if len(keywords) > 30:
+        console.print(f"  … {len(keywords) - 30} more")
+
+    if dry_run_keywords:
+        return
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    docs: list[dict] = []
+    seen_pids: set[str] = set()
+    empty_kw = 0
+
+    with output.open("a", encoding="utf-8") as fh:
+        for ki, kw in enumerate(keywords, 1):
+            got_any = False
+            for page in range(1, max(pages, 1) + 1):
+                try:
+                    payload = text_svc.text_search(
+                        key_word=kw,
+                        category_id=resolved_id,
+                        country_code=country,
+                        local=local,
+                        currency=currency,
+                        page_index=page,
+                        page_size=page_size,
+                        sort_by=sort_by,
+                        selection_name=selection_name,
+                    )
+                except DailyQuotaExhausted as exc:
+                    err_console.print(f"[yellow]{exc}[/yellow]")
+                    raise typer.Exit(code=2) from exc
+                except (ValueError, IopError, RuntimeError) as exc:
+                    err_console.print(f"[red]kw={kw!r} page={page}:[/red] {exc}")
+                    if isinstance(exc, IopError) and exc.body is not None:
+                        err_console.print_json(data=exc.body)
+                    break
+
+                products, meta = extract_search_products(payload)
+                console.print(
+                    f"[{ki}/{len(keywords)}] {kw!r} p{page}: "
+                    f"{len(products)} hits total≈{meta.get('total_count')}"
+                )
+                if not products:
+                    break
+                got_any = True
+                for product in products:
+                    doc = search_product_to_url_doc(
+                        product,
+                        keyword=kw,
+                        category_id=resolved_id,
+                        category_path=category_path,
+                    )
+                    if not doc or doc["product_id"] in seen_pids:
+                        continue
+                    seen_pids.add(doc["product_id"])
+                    docs.append(doc)
+                    fh.write(json.dumps(doc, ensure_ascii=False) + "\n")
+            if not got_any:
+                empty_kw += 1
+
+    indexed = 0
+    if write_es and docs:
+        es = make_es_client(settings)
+        # strip heavy raw before ES
+        slim = []
+        for d in docs:
+            row = dict(d)
+            row.pop("raw_search", None)
+            slim.append(row)
+        indexed = upsert_url_docs(es, settings.es_urls_index, slim)
+
+    queued = 0
+    if enqueue and docs:
+        from aliexpress_ds.queue import get_product_queue
+
+        q = get_product_queue(settings)
+        items = [
+            {
+                "product_id": d["product_id"],
+                "url": d.get("url"),
+                "source": d.get("source"),
+                "category": d.get("category"),
+            }
+            for d in docs
+        ]
+        queued, _skipped = q.enqueue_many(items, force=False)
+
+    console.print(
+        f"[green]Done[/green] discovered={len(docs)} es_indexed={indexed} "
+        f"enqueued={queued} empty_keywords={empty_kw} → {output}"
     )
 
 
@@ -930,6 +1216,62 @@ def queue_status() -> None:
         raise typer.Exit(code=1) from exc
     console.print(f"queue={settings.redis_queue_key} len={q.length()}")
     console.print(f"seen={settings.redis_queue_seen_key} count={q.seen_count()}")
+
+
+@app.command("rate-status")
+def rate_status() -> None:
+    """Show local daily counter vs last platform flow-control error (if any).
+
+    Successful AE responses do not include remaining daily quota. The only
+    platform-reported limits we see are error bodies (e.g. AppApiCallLimit ban
+    seconds). ALIEXPRESS_DAILY_LIMIT is a local client-side cap only.
+    """
+    from pathlib import Path
+
+    settings = get_settings()
+    state_path = Path("data/rate_limit_state.json")
+    platform_path = Path("data/platform_rate_limit.json")
+
+    console.print("[bold]Local client cap[/bold] (ALIEXPRESS_DAILY_LIMIT — not from API)")
+    console.print(f"  daily_limit={settings.aliexpress_daily_limit or '∞ (disabled)'}")
+    console.print(f"  min_interval_sec={settings.aliexpress_min_interval_sec}")
+    console.print(f"  queue_concurrency={settings.queue_concurrency}")
+    if state_path.exists():
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+            used = int(data.get("count") or 0)
+            day = data.get("day")
+            lim = settings.aliexpress_daily_limit
+            rem = None if lim <= 0 else max(0, lim - used)
+            console.print(f"  beijing_day={day} used≈{used} remaining≈{rem}")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            console.print(f"  [yellow]could not read {state_path}: {exc}[/yellow]")
+    else:
+        console.print(f"  {state_path}: (none yet)")
+
+    console.print(
+        "[bold]Last platform signal[/bold] "
+        "(from API error body only — success responses have no quota fields)"
+    )
+    if platform_path.exists():
+        try:
+            plat = json.loads(platform_path.read_text(encoding="utf-8"))
+            for k in (
+                "recorded_at",
+                "kind",
+                "sub_code",
+                "ban_seconds",
+                "stop_for_day",
+                "message",
+            ):
+                if k in plat:
+                    console.print(f"  {k}={plat[k]}")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            console.print(f"  [yellow]could not read {platform_path}: {exc}[/yellow]")
+    else:
+        console.print(
+            "  (none yet — will appear after AppApiCallLimit / App Call Limited)"
+        )
 
 
 @app.command("enqueue-es")
@@ -1462,7 +1804,16 @@ def queue_worker(
                     if max_jobs and fetched >= max_jobs:
                         stop.set()
                         return
-                job = await q.blocking_pop()
+                # blocking_pop retries Redis timeouts internally; do not let
+                # transient queue errors kill the systemd unit.
+                try:
+                    job = await q.blocking_pop()
+                except Exception as exc:
+                    err_console.print(
+                        f"[yellow]queue pop error (will retry):[/yellow] {exc}"
+                    )
+                    await asyncio.sleep(5)
+                    continue
                 if stop.is_set():
                     if job is not None:
                         await q.requeue(job)
@@ -1474,7 +1825,13 @@ def queue_worker(
                         stop.set()
                         return
                     if idle_rounds == 1 or idle_rounds % 12 == 0:
-                        qlen_now = await q.length()
+                        try:
+                            qlen_now = await q.length()
+                        except Exception as exc:
+                            err_console.print(
+                                f"[yellow]queue len error:[/yellow] {exc}"
+                            )
+                            qlen_now = "?"
                         console.print(f"… waiting for jobs (queue_len={qlen_now})")
                     continue
                 idle_rounds = 0

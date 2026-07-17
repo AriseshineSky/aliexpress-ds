@@ -38,11 +38,18 @@ uv run aliexpress-ds categories
 
 # 按 feed + 可选类目分页发现，写入 URL 索引
 uv run aliexpress-ds discover-feed -f "DS bestseller" -C 66 --pages 20 --sort volumeDesc
+
+# 关键词选品（官方 aliexpress.ds.text.search）— 指定类目目录，自动生成关键词海量拉 product_id
+uv run aliexpress-ds discover-search -C 66 --pages 5 --max-keywords 40 --write-es
+uv run aliexpress-ds discover-search -N "Beauty" --dry-run-keywords   # 只看生成的词
+uv run aliexpress-ds discover-search -C 66 -k "nail art" -k "eyelash" --enqueue
 ```
+
+`discover-search` 与 link-crawler 一样写入 `ES_URLS_INDEX`，可用 `enqueue-es` / `--enqueue` 进详情队列。
 
 协同说明见 `docs/CATEGORY_CRAWL_COORDINATION.md`。
 
-自由关键词 / 全站类目爬取用 `aliexpress-link-crawler`（读 ES `user1_aliexpress_crawl_categories`）。
+自由关键词 / 全站类目网页爬取仍可用 `aliexpress-link-crawler`（读 ES `user1_aliexpress_crawl_categories`）。
 
 ## 按 product_id 取商品信息 / 价格
 
@@ -146,28 +153,40 @@ sudo journalctl -u aliexpress-ds-queue-worker -f
 sudo systemctl list-timers 'aliexpress-ds*'
 ```
 
-## 官方限流（Open Platform）
+## 官方限流（AliExpress Open Service）
 
-官方文档不公布每个 DS API 的固定 QPS，而是三类限制 + response 退避：
+控制台（你的 App）：[openservice.aliexpress.com App Console](https://openservice.aliexpress.com/app/index.htm)  
+文档入口：[Documentation](https://openservice.aliexpress.com/doc/doc.htm) → **DropShippers API Developer**  
+工单/支持：[Contact us](https://openservice.aliexpress.com/support/index.htm)
 
-| 限制 | 子错误码 / 表现 | 处理 |
-|------|-----------------|------|
-| **AppKey 日配额**（北京时间） | `accesscontrol.limited-by-app-access-count`；Test=5000/天，上线后看 Console | 等到次日 00:00 GMT+8；本地用 `ALIEXPRESS_DAILY_LIMIT` 对齐 Console |
-| **API 级 QPS**（全平台） | `accesscontrol.limited-by-api-access-count` / `ApiCallLimits`；`ban will last N seconds` | **睡 N+1 秒后重试** |
-| **App+API 频率**（未上线常见） | `accesscontrol.limited-by-app-api-access-count`；错误码 **7** `App Call Limited` | 同上；上线后通常放宽 |
+**不要用淘宝开放平台**（`developer.alibaba.com` 的「管理证书 / 流量包」FAQ，如 articleId=101164）——那是 TOP 商家/服务市场应用规则，不是速卖通 Dropshipping。
 
-文档：
-- [API access count limitation](https://open.alitrip.com/docs/doc.htm?articleId=108426&docType=1)
-- [App Call Limited (code 7)](https://developer.alibaba.com/docs/doc.htm?articleId=108869&docType=1)
-- [Environments (Test 5k / Online by category)](https://open.fliggy.com/docs/doc.htm?articleId=108101&docType=1)
+日调用量（如 10万/天）以 **App Console 概览 / 证书** 为准。成功 API 响应**不返回**剩余配额。
+
+平台对调用还有频率类限制（与日配额独立）。`aliexpress.ds.product.get` 官方社区说明：
+
+- [Current limiting when calling aliexpress.ds.product.get](https://openservice.aliexpress.com/dada/community/index.htm?#/article-detail/1901) — 遇流控后 sleep 再重试
+
+本项目见到的真实错误多为：
+
+| 限制 | 表现 | 处理 |
+|------|------|------|
+| **日配额**（Console 流量包） | `limited-by-app-access-count` / 日调用耗尽至北京时间 24:00 | 等到次日；本地 `ALIEXPRESS_DAILY_LIMIT` 仅作客户端保护，应对齐 Console |
+| **App+API 频率** | `AppApiCallLimit`：*frequency of app access to the api* + `ban will last N seconds` | **睡 N+1 秒**；与是否用满 10万/天无关 |
+| **API 总频率** | `ApiCallLimits` / `ban will last N seconds` | 同上 |
+
+历史 AE 英文说明（三类 access count，域名在 alitrip，内容属 AliExpress Open Platform）：  
+[API access count limitation](https://open.alitrip.com/docs/doc.htm?articleId=108426&docType=1)
 
 本项目默认：
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `ALIEXPRESS_DAILY_LIMIT` | `5000` | 对齐 Test；上线后改成 Console 流量包（如 `400000`） |
-| `ALIEXPRESS_MIN_INTERVAL_SEC` | `0.5` | 主动 pacing；40万/天 ≈ `0.22`；遇流控会自适应拉长间隔 |
-| `ALIEXPRESS_MAX_RETRIES` | `6` | 每次 API：按 ban 秒数退避重试；传输错误指数退避 |
+| `ALIEXPRESS_DAILY_LIMIT` | `100000` | **本地**日帽，对齐 Console（如 10万）；`0`=不本地掐断 |
+| `ALIEXPRESS_MIN_INTERVAL_SEC` | `1.0` | 主动 pacing，降低 `AppApiCallLimit` |
+| `ALIEXPRESS_MAX_RETRIES` | `6` | 按 ban 秒数退避；传输错误指数退避 |
+
+查看：`uv run aliexpress-ds rate-status`（本地计数 + 最近一次平台错误原文）。
 
 `IopClient.execute` 统一：限速 → 发请求 → 解析流控 → 等待官方 ban 秒数 → 重试；日配额耗尽抛 `DailyQuotaExhausted` 并停工。
 
