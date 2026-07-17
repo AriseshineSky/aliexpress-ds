@@ -43,9 +43,17 @@ uv run aliexpress-ds discover-feed -f "DS bestseller" -C 66 --pages 20 --sort vo
 uv run aliexpress-ds discover-search -C 66 --pages 5 --max-keywords 40 --write-es
 uv run aliexpress-ds discover-search -N "Beauty" --dry-run-keywords   # 只看生成的词
 uv run aliexpress-ds discover-search -C 66 -k "nail art" -k "eyelash" --enqueue
+# API 侧可用过滤（searchExtend；**没有** price/rating/sold）：
+uv run aliexpress-ds discover-search -C 66 -k "nail art" --choice --ship-from CN --write-es
+uv run aliexpress-ds discover-search -C 66 -k "nail art" --free-ship-to US --seller-level GOLD
+
+# 持续海量选品（多 L1 轮询，分页直到空，目标 100 万 unique，2s/次 + 流控退避）
+uv run aliexpress-ds discover-search-loop \
+  --target-unique 1000000 --page-size 50 --min-interval 2.0 --min-rating 4.0 \
+  --max-keywords 200 --max-leaves 150 --write-es
 ```
 
-`discover-search` 与 link-crawler 一样写入 `ES_URLS_INDEX`，可用 `enqueue-es` / `--enqueue` 进详情队列。
+`discover-search` / `discover-search-loop` 写入 `ES_URLS_INDEX`（bulk **update + doc_as_upsert**）。本地默认丢弃 `rating < 4.0`（`--min-rating 4.0`；缺评分保留；`--min-rating 0` 关闭）。质量过滤（price/reviews/sold）仍用后续 `enqueue-es --quality-filter`。
 
 协同说明见 `docs/CATEGORY_CRAWL_COORDINATION.md`。
 

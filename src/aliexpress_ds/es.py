@@ -193,7 +193,7 @@ def upsert_url_docs(
     urls_index: str,
     docs: list[dict[str, Any]],
 ) -> int:
-    """Bulk index URL seed docs. Doc id = {source}_{product_id}."""
+    """Bulk upsert URL seed docs via update+doc_as_upsert. Doc id = {source}_{product_id}."""
     if not docs:
         return 0
     actions: list[dict[str, Any]] = []
@@ -205,8 +205,9 @@ def upsert_url_docs(
         doc_id = f"{source}_{pid}"
         body = dict(doc)
         body.pop("raw_feed", None)
-        actions.append({"index": {"_index": urls_index, "_id": doc_id}})
-        actions.append(body)
+        body.pop("raw_search", None)
+        actions.append({"update": {"_index": urls_index, "_id": doc_id}})
+        actions.append({"doc": body, "doc_as_upsert": True})
     if not actions:
         return 0
     resp = es.bulk(operations=actions, refresh=False)
@@ -215,12 +216,12 @@ def upsert_url_docs(
         ok = 0
         first_err: str | None = None
         for item in resp.get("items") or []:
-            idx = item.get("index") or {}
-            if idx.get("status") in (200, 201):
+            upd = item.get("update") or item.get("index") or {}
+            if upd.get("status") in (200, 201):
                 ok += 1
                 continue
             if first_err is None:
-                err = idx.get("error") or {}
+                err = upd.get("error") or {}
                 first_err = (
                     f"{err.get('type')}: {err.get('reason')}"
                     if isinstance(err, dict)

@@ -12,6 +12,81 @@ from typing import Any
 from aliexpress_ds.iop_client import IopClient
 from aliexpress_ds.standard_mapper import _to_float, _to_int
 
+# Official searchExtend keys (docId=1698). There is NO price / rating / sold filter.
+SEARCH_EXTEND_KEYS: frozenset[str] = frozenset(
+    {
+        "free_ship_to",
+        "item_tag",
+        "seller_level",
+        "ship_from",
+        "seller_online",
+        "hot_area",
+    }
+)
+
+
+def search_extend_item(
+    search_key: str,
+    search_value: str,
+    *,
+    min_value: str = "",
+    max_value: str = "",
+) -> dict[str, str]:
+    """One searchExtend object in the shape required by aliexpress.ds.text.search."""
+    return {
+        "min": str(min_value or ""),
+        "max": str(max_value or ""),
+        "searchKey": str(search_key),
+        "searchValue": str(search_value),
+    }
+
+
+def build_search_extend(
+    *,
+    choice: bool = False,
+    ship_from: str | None = None,
+    free_ship_to: str | None = None,
+    seller_level: str | None = None,
+    seller_online: str | None = None,
+    hot_area: str | None = None,
+    extra: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Build official searchExtend list. Returns None when empty.
+
+    Supported keys (platform-verified): free_ship_to, item_tag=choice,
+    seller_level, ship_from, seller_online, hot_area.
+    Price / rating / sold_count are NOT supported by the API (ignored if sent).
+    """
+    items: list[dict[str, Any]] = []
+    if choice:
+        items.append(search_extend_item("item_tag", "choice"))
+    if ship_from:
+        items.append(search_extend_item("ship_from", ship_from.strip().upper()))
+    if free_ship_to:
+        items.append(search_extend_item("free_ship_to", free_ship_to.strip().upper()))
+    if seller_level:
+        items.append(search_extend_item("seller_level", seller_level.strip().upper()))
+    if seller_online:
+        items.append(search_extend_item("seller_online", str(seller_online).strip()))
+    if hot_area:
+        items.append(search_extend_item("hot_area", hot_area.strip().upper()))
+    if extra:
+        for row in extra:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("searchKey") or row.get("search_key") or "").strip()
+            if not key:
+                continue
+            items.append(
+                search_extend_item(
+                    key,
+                    str(row.get("searchValue") or row.get("search_value") or ""),
+                    min_value=str(row.get("min") or ""),
+                    max_value=str(row.get("max") or ""),
+                )
+            )
+    return items or None
+
 
 class TextService:
     """Dropshipping text search — product discovery by keyword."""

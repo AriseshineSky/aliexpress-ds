@@ -675,15 +675,55 @@ def discover_search(
     sort_by: str = typer.Option(
         "orders,desc",
         "--sort-by",
-        help="min_price/orders/comments + ,asc|,desc",
+        help="min_price/orders/comments + ,asc|,desc (sort only; not a filter)",
     ),
     country: str = typer.Option("US", "--country", "-c"),
     local: str = typer.Option("en_US", "--local"),
     currency: str = typer.Option("USD", "--currency"),
+    choice: bool = typer.Option(
+        False,
+        "--choice/--no-choice",
+        help="API searchExtend: Choice products only (item_tag=choice)",
+    ),
+    ship_from: Optional[str] = typer.Option(
+        None,
+        "--ship-from",
+        help="API searchExtend: ship_from country code (e.g. CN, US)",
+    ),
+    free_ship_to: Optional[str] = typer.Option(
+        None,
+        "--free-ship-to",
+        help="API searchExtend: free_ship_to country code (e.g. US)",
+    ),
+    seller_level: Optional[str] = typer.Option(
+        None,
+        "--seller-level",
+        help="API searchExtend: GOLD or SILVER",
+    ),
+    seller_online: Optional[str] = typer.Option(
+        None,
+        "--seller-online",
+        help="API searchExtend: seller online within hours (48 or 72)",
+    ),
+    hot_area: Optional[str] = typer.Option(
+        None,
+        "--hot-area",
+        help="API searchExtend: hot_area (BR/US/UK/GB/FR/AU)",
+    ),
+    search_extend_json: Optional[str] = typer.Option(
+        None,
+        "--search-extend-json",
+        help='Raw searchExtend JSON list, e.g. \'[{"searchKey":"item_tag","searchValue":"choice"}]\'',
+    ),
+    min_rating: float = typer.Option(
+        4.0,
+        "--min-rating",
+        help="Local filter: drop hits with rating < this (missing rating kept). 0 = keep all",
+    ),
     write_es: bool = typer.Option(
         True,
         "--write-es/--no-write-es",
-        help="Upsert into ES_URLS_INDEX (same as link-crawler seeds)",
+        help="Upsert kept hits into ES_URLS_INDEX (after --min-rating filter)",
     ),
     enqueue: bool = typer.Option(
         False,
@@ -706,6 +746,10 @@ def discover_search(
     Like link-crawler URL scrape, but through the official DS Search API:
     pick a category directory, auto-generate keywords (or pass your own),
     paginate results → ES urls index (and optional Redis queue).
+
+    Note: API has NO price/rating/sold filters. Use --sort-by for ordering and
+    searchExtend flags (--choice / --ship-from / …) for platform-supported filters.
+    Locally drops rating < --min-rating (default 4.0); missing rating is kept.
     """
     from aliexpress_ds.categories import CategoryService, flatten_category_tree
     from aliexpress_ds.keywords import (
@@ -716,6 +760,7 @@ def discover_search(
     from aliexpress_ds.rate_limit import RateLimiter
     from aliexpress_ds.search import (
         TextService,
+        build_search_extend,
         extract_search_products,
         search_product_to_url_doc,
     )
@@ -739,6 +784,28 @@ def discover_search(
     iop = IopClient(limiter=limiter)
     cats = CategoryService(client=iop)
     text_svc = TextService(client=iop)
+
+    extra_extend: list[dict] | None = None
+    if search_extend_json:
+        try:
+            parsed = json.loads(search_extend_json)
+        except json.JSONDecodeError as exc:
+            err_console.print(f"[red]Invalid --search-extend-json:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        if not isinstance(parsed, list):
+            err_console.print("[red]--search-extend-json must be a JSON list[/red]")
+            raise typer.Exit(code=1)
+        extra_extend = [x for x in parsed if isinstance(x, dict)]
+
+    search_extend = build_search_extend(
+        choice=choice,
+        ship_from=ship_from,
+        free_ship_to=free_ship_to,
+        seller_level=seller_level,
+        seller_online=seller_online,
+        hot_area=hot_area,
+        extra=extra_extend,
+    )
 
     # Resolve category tree for keyword expansion / name → id
     console.print("Loading DS category tree …")
@@ -811,7 +878,9 @@ def discover_search(
     console.print(
         f"Keywords={len(keywords)} category_id={resolved_id or '-'} "
         f"path={category_path or '-'} selection={selection_name or '-'} "
-        f"pages≤{pages} page_size={page_size}"
+        f"pages≤{pages} page_size={page_size} sort={sort_by} "
+        f"min_rating={min_rating} "
+        f"searchExtend={json.dumps(search_extend, ensure_ascii=False) if search_extend else '-'}"
     )
     for i, kw in enumerate(keywords[:30], 1):
         console.print(f"  {i:3}. {kw}")
@@ -825,6 +894,8 @@ def discover_search(
     docs: list[dict] = []
     seen_pids: set[str] = set()
     empty_kw = 0
+    dropped_low_rating = 0
+    rating_floor = float(min_rating)
 
     with output.open("a", encoding="utf-8") as fh:
         for ki, kw in enumerate(keywords, 1):
@@ -841,6 +912,7 @@ def discover_search(
                         page_size=page_size,
                         sort_by=sort_by,
                         selection_name=selection_name,
+                        search_extend=search_extend,
                     )
                 except DailyQuotaExhausted as exc:
                     err_console.print(f"[yellow]{exc}[/yellow]")
@@ -869,6 +941,16 @@ def discover_search(
                     if not doc or doc["product_id"] in seen_pids:
                         continue
                     seen_pids.add(doc["product_id"])
+                    rating = doc.get("rating")
+                    if (
+                        rating_floor > 0
+                        and rating is not None
+                        and float(rating) < rating_floor
+                    ):
+                        dropped_low_rating += 1
+                        continue
+                    if search_extend:
+                        doc["search_extend"] = search_extend
                     docs.append(doc)
                     fh.write(json.dumps(doc, ensure_ascii=False) + "\n")
             if not got_any:
@@ -903,7 +985,387 @@ def discover_search(
 
     console.print(
         f"[green]Done[/green] discovered={len(docs)} es_indexed={indexed} "
-        f"enqueued={queued} empty_keywords={empty_kw} → {output}"
+        f"enqueued={queued} empty_keywords={empty_kw} "
+        f"dropped_rating_lt_{rating_floor}={dropped_low_rating} → {output}"
+    )
+
+
+@app.command("discover-search-loop")
+def discover_search_loop(
+    target_unique: int = typer.Option(
+        1_000_000,
+        "--target-unique",
+        help="Stop after this many unique product_ids kept (rating filter applied)",
+    ),
+    max_pages_per_keyword: int = typer.Option(
+        200,
+        "--max-pages-per-keyword",
+        help="Soft ceiling per keyword (0 = unlimited until empty/no-new)",
+    ),
+    page_size: int = typer.Option(50, "--page-size", help="1-50"),
+    sort_by: str = typer.Option("orders,desc", "--sort-by"),
+    country: str = typer.Option("US", "--country", "-c"),
+    local: str = typer.Option("en_US", "--local"),
+    currency: str = typer.Option("USD", "--currency"),
+    min_interval: float = typer.Option(
+        2.0,
+        "--min-interval",
+        help="Seconds between API calls (plus response-driven ban sleep)",
+    ),
+    min_rating: float = typer.Option(
+        4.0,
+        "--min-rating",
+        help="Drop hits with rating < this (missing rating kept). 0 = keep all",
+    ),
+    max_keywords: int = typer.Option(200, "--max-keywords"),
+    max_leaves: int = typer.Option(150, "--max-leaves"),
+    flush_every: int = typer.Option(
+        100,
+        "--flush-every",
+        help="Upsert to ES every N kept docs",
+    ),
+    checkpoint: Path = typer.Option(
+        Path("data/discover_search_checkpoint.json"),
+        "--checkpoint",
+    ),
+    categories_file: Optional[Path] = typer.Option(
+        None,
+        "--categories-file",
+        help="Optional file: one category_id per line (overrides built-in priority L1 list)",
+    ),
+    choice: bool = typer.Option(False, "--choice/--no-choice"),
+    ship_from: Optional[str] = typer.Option(None, "--ship-from"),
+    free_ship_to: Optional[str] = typer.Option(None, "--free-ship-to"),
+    seller_level: Optional[str] = typer.Option(None, "--seller-level"),
+    seller_online: Optional[str] = typer.Option(None, "--seller-online"),
+    hot_area: Optional[str] = typer.Option(None, "--hot-area"),
+    write_es: bool = typer.Option(True, "--write-es/--no-write-es"),
+    output: Path = typer.Option(
+        Path("data/discovered_search_urls_mass.jsonl"),
+        "--output",
+        "-o",
+    ),
+) -> None:
+    """Continuous multi-L1 text.search until --target-unique product_ids.
+
+    Paginates each keyword until empty / no-new pages (soft max-pages ceiling).
+    Checkpoint/resume; ES update+doc_as_upsert; local rating filter.
+    """
+    from aliexpress_ds.categories import CategoryService, flatten_category_tree
+    from aliexpress_ds.keywords import (
+        PRIORITY_L1_CATEGORY_IDS,
+        SKIP_L1_CATEGORY_IDS,
+        keywords_from_category_rows,
+    )
+    from aliexpress_ds.rate_limit import RateLimiter
+    from aliexpress_ds.search import (
+        TextService,
+        build_search_extend,
+        extract_search_products,
+        search_product_to_url_doc,
+    )
+
+    settings = get_settings()
+    try:
+        settings.require_credentials()
+        if write_es:
+            settings.require_es()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    interval = max(0.5, float(min_interval))
+    rating_floor = float(min_rating)
+    soft_pages = int(max_pages_per_keyword)
+    flush_n = max(1, int(flush_every))
+    target = max(1, int(target_unique))
+
+    limiter = RateLimiter(
+        min_interval_sec=interval,
+        daily_limit=settings.aliexpress_daily_limit,
+        state_path=Path("data/rate_limit_discover.json"),
+    )
+    iop = IopClient(limiter=limiter)
+    cats = CategoryService(client=iop)
+    text_svc = TextService(client=iop)
+    search_extend = build_search_extend(
+        choice=choice,
+        ship_from=ship_from,
+        free_ship_to=free_ship_to,
+        seller_level=seller_level,
+        seller_online=seller_online,
+        hot_area=hot_area,
+    )
+
+    console.print("Loading DS category tree …")
+    try:
+        tree_payload = cats.fetch_raw()
+    except (ValueError, IopError, DailyQuotaExhausted, RuntimeError) as exc:
+        err_console.print(f"[red]category.get failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    rows = flatten_category_tree(tree_payload)
+    path_by_id = {
+        str(r.get("category_id")): str(r.get("path") or "")
+        for r in rows
+        if r.get("category_id")
+    }
+
+    if categories_file is not None:
+        cat_ids = [
+            ln.strip()
+            for ln in categories_file.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+    else:
+        cat_ids = [
+            cid
+            for cid in PRIORITY_L1_CATEGORY_IDS
+            if cid not in SKIP_L1_CATEGORY_IDS
+        ]
+
+    # Resume state
+    state: dict = {
+        "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "target_unique": target,
+        "unique_count": 0,
+        "es_indexed": 0,
+        "api_calls": 0,
+        "dropped_low_rating": 0,
+        "cat_index": 0,
+        "kw_index": 0,
+        "page": 1,
+        "category_id": None,
+        "keyword": None,
+        "seen_pids": [],  # truncated list for resume; full set loaded from output/ES optional
+    }
+    if checkpoint.exists():
+        try:
+            loaded = json.loads(checkpoint.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                state.update(loaded)
+                console.print(
+                    f"Resumed checkpoint unique={state.get('unique_count')} "
+                    f"cat={state.get('category_id')} kw={state.get('keyword')!r} "
+                    f"page={state.get('page')}"
+                )
+        except (OSError, json.JSONDecodeError) as exc:
+            err_console.print(f"[yellow]checkpoint load failed, starting fresh:[/yellow] {exc}")
+
+    seen_pids: set[str] = set(str(x) for x in (state.get("seen_pids") or []) if x)
+    kept_count = int(state.get("unique_count") or 0)
+    # Seed seen + kept from existing output jsonl (unique across restarts)
+    if output.exists():
+        file_kept = 0
+        with output.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pid = str(row.get("product_id") or "").strip()
+                if pid:
+                    seen_pids.add(pid)
+                    file_kept += 1
+        kept_count = max(kept_count, file_kept)
+
+    es = make_es_client(settings) if write_es else None
+    pending: list[dict] = []
+    total_indexed = int(state.get("es_indexed") or 0)
+    dropped = int(state.get("dropped_low_rating") or 0)
+    api_calls = int(state.get("api_calls") or 0)
+
+    def _save_checkpoint(**extra: object) -> None:
+        state.update(extra)
+        state["unique_count"] = kept_count
+        state["seen_total"] = len(seen_pids)
+        state["es_indexed"] = total_indexed
+        state["dropped_low_rating"] = dropped
+        state["api_calls"] = api_calls
+        state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        # Keep last 5k ids for resume hints without huge files
+        state["seen_pids"] = list(seen_pids)[-5000:]
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _flush() -> None:
+        nonlocal pending, total_indexed
+        if not pending or es is None:
+            pending = []
+            return
+        slim = []
+        for d in pending:
+            row = dict(d)
+            row.pop("raw_search", None)
+            slim.append(row)
+        n = upsert_url_docs(es, settings.es_urls_index, slim)
+        total_indexed += n
+        pending = []
+        _save_checkpoint()
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    console.print(
+        f"Loop target={target} cats={len(cat_ids)} page_size={page_size} "
+        f"interval≥{interval}s min_rating={rating_floor} "
+        f"max_pages/kw={soft_pages or '∞'} flush_every={flush_n} "
+        f"already_kept={kept_count}"
+    )
+
+    start_cat = int(state.get("cat_index") or 0)
+    resume_kw = int(state.get("kw_index") or 0)
+    resume_page = int(state.get("page") or 1)
+
+    try:
+        with output.open("a", encoding="utf-8") as fh:
+            for ci in range(start_cat, len(cat_ids)):
+                if kept_count >= target:
+                    break
+                cid = str(cat_ids[ci])
+                cpath = path_by_id.get(cid) or cid
+                keywords = keywords_from_category_rows(
+                    rows,
+                    parent_category_id=cid,
+                    max_leaves=max_leaves,
+                )[: max(1, int(max_keywords))]
+                # de-dupe
+                seen_kw: set[str] = set()
+                uniq_kw: list[str] = []
+                for kw in keywords:
+                    k = kw.strip().lower()
+                    if not k or k in seen_kw:
+                        continue
+                    seen_kw.add(k)
+                    uniq_kw.append(k)
+                keywords = uniq_kw
+                console.print(
+                    f"[bold]Category[/bold] [{ci + 1}/{len(cat_ids)}] "
+                    f"id={cid} path={cpath} keywords={len(keywords)}"
+                )
+
+                kw_start = resume_kw if ci == start_cat else 0
+                for ki in range(kw_start, len(keywords)):
+                    if kept_count >= target:
+                        break
+                    kw = keywords[ki]
+                    page = resume_page if (ci == start_cat and ki == kw_start) else 1
+                    # clear one-shot resume
+                    resume_kw = 0
+                    resume_page = 1
+                    empty_new_streak = 0
+                    while True:
+                        if soft_pages > 0 and page > soft_pages:
+                            break
+                        if kept_count >= target:
+                            break
+                        try:
+                            payload = text_svc.text_search(
+                                key_word=kw,
+                                category_id=cid,
+                                country_code=country,
+                                local=local,
+                                currency=currency,
+                                page_index=page,
+                                page_size=page_size,
+                                sort_by=sort_by,
+                                search_extend=search_extend,
+                            )
+                            api_calls += 1
+                        except DailyQuotaExhausted as exc:
+                            _flush()
+                            _save_checkpoint(
+                                cat_index=ci,
+                                kw_index=ki,
+                                page=page,
+                                category_id=cid,
+                                keyword=kw,
+                            )
+                            err_console.print(f"[yellow]{exc}[/yellow]")
+                            raise typer.Exit(code=2) from exc
+                        except (ValueError, IopError, RuntimeError) as exc:
+                            err_console.print(f"[red]kw={kw!r} page={page}:[/red] {exc}")
+                            if isinstance(exc, IopError) and exc.body is not None:
+                                err_console.print_json(data=exc.body)
+                            _flush()
+                            _save_checkpoint(
+                                cat_index=ci,
+                                kw_index=ki,
+                                page=page,
+                                category_id=cid,
+                                keyword=kw,
+                            )
+                            break
+
+                        products, meta = extract_search_products(payload)
+                        new_this_page = 0
+                        for product in products:
+                            doc = search_product_to_url_doc(
+                                product,
+                                keyword=kw,
+                                category_id=cid,
+                                category_path=cpath,
+                            )
+                            if not doc or doc["product_id"] in seen_pids:
+                                continue
+                            seen_pids.add(doc["product_id"])
+                            rating = doc.get("rating")
+                            if (
+                                rating_floor > 0
+                                and rating is not None
+                                and float(rating) < rating_floor
+                            ):
+                                dropped += 1
+                                continue
+                            if search_extend:
+                                doc["search_extend"] = search_extend
+                            fh.write(json.dumps(doc, ensure_ascii=False) + "\n")
+                            pending.append(doc)
+                            new_this_page += 1
+                            kept_count += 1
+                            if len(pending) >= flush_n:
+                                _flush()
+
+                        console.print(
+                            f"  [{ci + 1}/{len(cat_ids)}][{ki + 1}/{len(keywords)}] "
+                            f"{kw!r} p{page}: hits={len(products)} new={new_this_page} "
+                            f"kept={kept_count}/{target} "
+                            f"total≈{meta.get('total_count')}"
+                        )
+                        _save_checkpoint(
+                            cat_index=ci,
+                            kw_index=ki,
+                            page=page + 1,
+                            category_id=cid,
+                            keyword=kw,
+                        )
+
+                        if not products:
+                            break
+                        if new_this_page == 0:
+                            empty_new_streak += 1
+                            if empty_new_streak >= 2:
+                                break
+                        else:
+                            empty_new_streak = 0
+                        page += 1
+                # finished category — advance checkpoint
+                _flush()
+                _save_checkpoint(
+                    cat_index=ci + 1,
+                    kw_index=0,
+                    page=1,
+                    category_id=cid,
+                    keyword=None,
+                )
+    finally:
+        _flush()
+        _save_checkpoint()
+
+    console.print(
+        f"[green]Done[/green] kept={kept_count} es_indexed={total_indexed} "
+        f"api_calls={api_calls} dropped_rating_lt_{rating_floor}={dropped} "
+        f"checkpoint={checkpoint} → {output}"
     )
 
 

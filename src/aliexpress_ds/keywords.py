@@ -250,6 +250,47 @@ def keywords_from_names(
     return out
 
 
+# Priority L1 category_ids for mass discover-search-loop (plan order).
+# Skip: Second-Hand, Special Category, Books, Food.
+PRIORITY_L1_CATEGORY_IDS: tuple[str, ...] = (
+    "66",  # Beauty & Health
+    "36",  # Jewelry & Accessories
+    "15",  # Home & Garden
+    "44",  # Consumer Electronics
+    "509",  # Phones & Telecommunications
+    "202192403",  # Phones & Telecommunications Accessories
+    "200165144",  # Hair Extensions & Wigs
+    "1501",  # Mother & Kids
+    "18",  # Sports & Entertainment
+    "39",  # Lights & Lighting
+    "3",  # Apparel & Accessories
+    "200000297",  # Apparel Accessories
+    "200000343",  # Men's Clothing
+    "7",  # Computer & Office
+    "21",  # Office & School Supplies
+    "6",  # Home Appliances
+    "13",  # Home Improvement
+    "1503",  # Furniture
+    "34",  # Automobiles, Parts & Accessories
+    "201355758",  # Motorcycle Equipments & Parts
+    "1524",  # Luggage & Bags
+    "322",  # Shoes
+    "200000532",  # Novelty & Special Use
+    "30",  # Security & Protection
+    "502",  # Electronic Components & Supplies
+    "202216001",  # Industrial & Business
+)
+
+SKIP_L1_CATEGORY_IDS: frozenset[str] = frozenset(
+    {
+        "201520802",  # Second-Hand
+        "200001075",  # Special Category
+        "202228412",  # Books & Cultural Merchandise
+        "2",  # Food
+    }
+)
+
+
 def load_keywords_file(path: str) -> list[str]:
     from pathlib import Path
 
