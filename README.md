@@ -141,10 +141,29 @@ uv run aliexpress-ds enqueue-es --no-category-blacklist   # 临时关闭
 2. **本项目自动读/刷新**：每次 API 调用前若 `access_token` 将在 **1 小时内**过期，会调 `/auth/token/refresh` 并写回同一 Redis。
 3. **手动**：`uv run aliexpress-ds refresh-token`（`--force` 强制刷新）。
 
-### 部署到 VPS（Admin@34.172.204.102）
+### 部署到 VPS（Admin@34.172.204.102 / mongo）
+
+默认用 **git pull**（保留远端 `.env` / `.venv` / `data/`）：
 
 ```bash
 ./scripts/deploy_vps.sh
+# 或
+DEPLOY_HOST=Admin@35.202.167.107 ./scripts/deploy_vps.sh
+
+# 只更新代码、不重启 worker：
+SKIP_START=1 ./scripts/deploy_vps.sh
+
+# 仍可用 rsync：
+DEPLOY_MODE=rsync ./scripts/deploy_vps.sh
+```
+
+在 VPS 上手动更新：
+
+```bash
+cd /home/Admin/aliexpress-ds
+git fetch origin && git reset --hard origin/main
+uv sync
+sudo systemctl restart aliexpress-ds-queue-worker
 ```
 
 安装目录：`/home/Admin/aliexpress-ds`  
