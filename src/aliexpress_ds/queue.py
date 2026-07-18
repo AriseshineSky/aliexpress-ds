@@ -154,31 +154,75 @@ class ProductQueue:
         items: list[dict[str, Any]],
         *,
         force: bool = False,
+        batch_size: int = 1000,
     ) -> tuple[int, int]:
-        """Enqueue list of {product_id, url?, source?}. Returns (new, skipped)."""
+        """Enqueue list of {product_id, url?, source?}. Returns (new, skipped).
+
+        Uses Redis pipelines so mass re-queue (100k+) finishes in minutes.
+        """
         new = 0
         skipped = 0
+        batch_size = max(100, int(batch_size))
+        buf: list[tuple[str, str]] = []  # (pid, payload)
+
+        def _flush(chunk: list[tuple[str, str]]) -> None:
+            nonlocal new, skipped
+            if not chunk:
+                return
+            pids = [pid for pid, _ in chunk]
+            if force:
+                pipe = self.client.pipeline(transaction=False)
+                for pid in pids:
+                    pipe.sadd(self.seen_key, pid)
+                pipe.execute()
+                pipe = self.client.pipeline(transaction=False)
+                for _pid, payload in chunk:
+                    pipe.lpush(self.queue_key, payload)
+                pipe.execute()
+                new += len(chunk)
+                return
+
+            # Non-force: only enqueue ids newly added to seen
+            pipe = self.client.pipeline(transaction=False)
+            for pid in pids:
+                pipe.sadd(self.seen_key, pid)
+            sadd_flags = pipe.execute()
+            pipe = self.client.pipeline(transaction=False)
+            pushed = 0
+            for (pid, payload), flag in zip(chunk, sadd_flags, strict=True):
+                if int(flag or 0) == 1:
+                    pipe.lpush(self.queue_key, payload)
+                    pushed += 1
+                else:
+                    skipped += 1
+            if pushed:
+                pipe.execute()
+                new += pushed
+            else:
+                # avoid executing empty pipeline
+                pass
+
         for item in items:
             pid = str(item.get("product_id") or "").strip()
             if not pid:
                 skipped += 1
                 continue
-            ok = self.enqueue(
+            extra = {
+                k: v
+                for k, v in item.items()
+                if k not in ("product_id", "url", "source") and v is not None
+            } or None
+            payload = self._encode_job(
                 pid,
                 url=item.get("url"),
                 source=item.get("source"),
-                force=force,
-                extra={
-                    k: v
-                    for k, v in item.items()
-                    if k not in ("product_id", "url", "source") and v is not None
-                }
-                or None,
+                extra=extra,
             )
-            if ok:
-                new += 1
-            else:
-                skipped += 1
+            buf.append((pid, payload))
+            if len(buf) >= batch_size:
+                _flush(buf)
+                buf = []
+        _flush(buf)
         return new, skipped
 
     def blocking_pop(self, timeout: int | None = None) -> dict[str, Any] | None:
