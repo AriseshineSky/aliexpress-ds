@@ -1680,6 +1680,46 @@ def queue_status() -> None:
     console.print(f"seen={settings.redis_queue_seen_key} count={q.seen_count()}")
 
 
+@app.command("queue-clear")
+def queue_clear(
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Confirm clearing the shared Redis product queue (+ seen set)",
+    ),
+    keep_seen: bool = typer.Option(
+        False,
+        "--keep-seen",
+        help="Only delete the pending list; keep the seen set",
+    ),
+) -> None:
+    """Empty Redis product task queue (and seen set by default)."""
+    from aliexpress_ds.queue import get_product_queue
+
+    settings = get_settings()
+    try:
+        settings.require_queue_redis()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    q = get_product_queue(settings)
+    console.print(
+        f"queue={settings.redis_queue_key} len={q.length()}  "
+        f"seen={settings.redis_queue_seen_key} count={q.seen_count()}"
+    )
+    if not yes:
+        err_console.print("[red]Refusing without --yes[/red]")
+        raise typer.Exit(code=2)
+    stats = q.clear(clear_seen=not keep_seen)
+    console.print(
+        f"[green]Cleared[/green] queue_removed={stats['queue_removed']} "
+        f"seen_removed={stats['seen_removed']}"
+    )
+    console.print(f"queue len now={q.length()} seen now={q.seen_count()}")
+
+
 @app.command("rate-status")
 def rate_status() -> None:
     """Show local daily counter vs last platform flow-control error (if any).
@@ -1776,6 +1816,11 @@ def enqueue_es(
         None,
         "--min-sold",
         help="sold_count >= this (default: ENQUEUE_MIN_SOLD_COUNT)",
+    ),
+    sort_by: str = typer.Option(
+        "rating,desc",
+        "--sort-by",
+        help="Sort candidates before LPUSH: rating,desc|rating,asc|none",
     ),
     category_blacklist: bool | None = typer.Option(
         None,
@@ -1920,6 +1965,27 @@ def enqueue_es(
         console.print(
             f"Category blacklist removed {blocked_category} "
             f"(before={before_blacklist} after={len(pending)})"
+        )
+
+    sort_key = (sort_by or "none").strip().lower()
+    if sort_key not in {"", "none", "-"}:
+        field, _, direction = sort_key.partition(",")
+        field = field.strip() or "rating"
+        reverse = (direction.strip() or "desc").lower() != "asc"
+
+        def _sort_val(item: dict) -> float:
+            raw = item.get(field)
+            try:
+                if raw is None or raw == "":
+                    return float("-inf") if reverse else float("inf")
+                return float(raw)
+            except (TypeError, ValueError):
+                return float("-inf") if reverse else float("inf")
+
+        pending.sort(key=_sort_val, reverse=reverse)
+        console.print(
+            f"Sorted by {field} {'desc' if reverse else 'asc'} "
+            f"(top rating sample={pending[0].get('rating') if pending else '-'})"
         )
 
     if limit and limit > 0:

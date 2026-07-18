@@ -140,6 +140,15 @@ class ProductQueue:
         self.client.lpush(self.queue_key, payload)
         return True
 
+    def clear(self, *, clear_seen: bool = True) -> dict[str, int]:
+        """Delete pending queue list and optionally the seen set. Returns sizes removed."""
+        qlen = int(self.client.llen(self.queue_key) or 0)
+        seen = int(self.client.scard(self.seen_key) or 0)
+        self.client.delete(self.queue_key)
+        if clear_seen:
+            self.client.delete(self.seen_key)
+        return {"queue_removed": qlen, "seen_removed": seen if clear_seen else 0}
+
     def enqueue_many(
         self,
         items: list[dict[str, Any]],
