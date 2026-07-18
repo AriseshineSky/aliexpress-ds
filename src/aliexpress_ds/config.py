@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     # Match Console 管理证书, or 0 = no local daily stop (platform errors still apply).
     # QPS / AppApiCallLimit ban seconds come only from error responses.
     aliexpress_daily_limit: int = 100000
-    aliexpress_min_interval_sec: float = 1.0  # ~1 QPS; adaptive up on AppApiCallLimit
+    aliexpress_min_interval_sec: float = 5.0  # ~0.2 QPS; hard bans persist a higher floor
     aliexpress_max_retries: int = 6  # flow-control / transport retries per call
 
     # Quality gates for enqueue-es (from ES urls index listing fields).

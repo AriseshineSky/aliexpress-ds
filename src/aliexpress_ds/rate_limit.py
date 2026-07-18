@@ -44,10 +44,14 @@ BEIJING = timezone(timedelta(hours=8))
 
 # Conservative defaults: Online apps rarely publish a fixed QPS for DS APIs.
 # Proactive pacing stays under typical soft caps; response-driven backoff handles the rest.
-DEFAULT_MIN_INTERVAL_SEC = 1.0  # ~1 QPS; safer against AppApiCallLimit
+DEFAULT_MIN_INTERVAL_SEC = 5.0  # ~0.2 QPS; long AppApiCallLimit bans at 1–3s pacing
 DEFAULT_DAILY_LIMIT = 5000  # Formal Test Environment
-MAX_ADAPTIVE_INTERVAL_SEC = 8.0
+MAX_ADAPTIVE_INTERVAL_SEC = 15.0
 MIN_ADAPTIVE_INTERVAL_SEC = 0.2
+# After multi-hour App+API bans, never resume faster than this until process restart
+# with a higher env floor (persisted across restarts via state file).
+HARD_BAN_MIN_INTERVAL_SEC = 5.0
+HARD_BAN_THRESHOLD_SEC = 3600.0
 
 
 class FlowKind(str, Enum):
@@ -221,13 +225,38 @@ class RateLimiter:
                 data = json.loads(self.state_path.read_text(encoding="utf-8"))
                 if data.get("day") == self._day:
                     self._count = int(data.get("count") or 0)
+                # Persist pacing floor raised after hard bans (survive systemd restart).
+                saved_base = float(data.get("base_interval_sec") or 0)
+                if saved_base > self.base_interval_sec:
+                    self.base_interval_sec = min(MAX_ADAPTIVE_INTERVAL_SEC, saved_base)
+                    self.min_interval_sec = self.base_interval_sec
+                    self._effective_interval = self.base_interval_sec
+                # Resume wall-clock cooldown if still active from prior process.
+                cool_until = data.get("cooldown_until_epoch")
+                if cool_until is not None:
+                    remaining = float(cool_until) - time.time()
+                    if remaining > 1.0:
+                        self._cooldown_until = time.monotonic() + remaining
+                        logger.warning(
+                            "Resumed platform cooldown %.0fs from state file",
+                            remaining,
+                        )
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
 
     def _save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        cool_remaining = max(0.0, self._cooldown_until - time.monotonic())
+        payload: dict[str, Any] = {
+            "day": self._day,
+            "count": self._count,
+            "base_interval_sec": self.base_interval_sec,
+            "effective_interval_sec": self._effective_interval,
+        }
+        if cool_remaining > 1.0:
+            payload["cooldown_until_epoch"] = time.time() + cool_remaining
         self.state_path.write_text(
-            json.dumps({"day": self._day, "count": self._count}, ensure_ascii=False),
+            json.dumps(payload, ensure_ascii=False),
             encoding="utf-8",
         )
 
@@ -363,13 +392,27 @@ class RateLimiter:
             # Hard App+API bans (minutes+) mean proactive pacing was too aggressive —
             # raise the floor so we do not re-trigger immediately after the cool-down.
             if cool >= 60.0 and fc.kind in {FlowKind.APP_API, FlowKind.API_QPS, FlowKind.UNKNOWN}:
-                new_base = min(
-                    MAX_ADAPTIVE_INTERVAL_SEC,
-                    max(self.base_interval_sec * 1.5, self.base_interval_sec + 0.1, 1.0),
-                )
+                if cool >= HARD_BAN_THRESHOLD_SEC:
+                    new_base = min(
+                        MAX_ADAPTIVE_INTERVAL_SEC,
+                        max(
+                            HARD_BAN_MIN_INTERVAL_SEC,
+                            self.base_interval_sec * 2.0,
+                            self.base_interval_sec + 2.0,
+                        ),
+                    )
+                else:
+                    new_base = min(
+                        MAX_ADAPTIVE_INTERVAL_SEC,
+                        max(
+                            self.base_interval_sec * 1.5,
+                            self.base_interval_sec + 0.1,
+                            1.0,
+                        ),
+                    )
                 if new_base > self.base_interval_sec:
                     logger.warning(
-                        "Hard ban %.0fs — raising base interval %.2fs→%.2fs for this process",
+                        "Hard ban %.0fs — raising base interval %.2fs→%.2fs (persisted)",
                         cool,
                         self.base_interval_sec,
                         new_base,
@@ -377,6 +420,7 @@ class RateLimiter:
                     self.base_interval_sec = new_base
                     self.min_interval_sec = new_base
                     self._effective_interval = max(self._effective_interval, new_base)
+            self._save()
             self._save_platform_signal(fc, cool)
             logger.warning(
                 "Flow control kind=%s sub=%s sleep=%.1fs interval→%.2fs base=%.2fs",
