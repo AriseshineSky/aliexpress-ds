@@ -328,8 +328,16 @@ def config_check() -> None:
     except ValueError as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
+    from aliexpress_ds.app_registry import REDIS_APPS_KEY, load_app_from_redis
+
+    app_meta = load_app_from_redis(settings.aliexpress_app_key, settings=settings)
     console.print("[green]Credentials OK[/green]")
     console.print(f"app_key={settings.aliexpress_app_key}")
+    if app_meta and app_meta.get("label"):
+        console.print(f"app_label={app_meta['label']}")
+    console.print(
+        f"app_secret_source={'redis:' + REDIS_APPS_KEY if app_meta else 'env'}"
+    )
     console.print(f"api_url={settings.aliexpress_api_url}")
     console.print(f"oauth_redis={'yes' if settings.redis_url else 'no'}")
     if settings.redis_url:
@@ -339,6 +347,8 @@ def config_check() -> None:
     console.print(f"queue_redis={'yes' if settings.redis_queue_url else 'no'}")
     console.print(f"token=…{token[-6:]}")
     if data:
+        if data.get("account"):
+            console.print(f"account={data.get('account')}")
         console.print(f"expires_at={data.get('expires_at')}")
         console.print(f"refresh_expires_at={data.get('refresh_expires_at')}")
         console.print(f"access_expired_soon={access_token_expired(data)}")

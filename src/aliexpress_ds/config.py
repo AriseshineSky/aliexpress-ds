@@ -76,11 +76,18 @@ class Settings(BaseSettings):
             )
 
     def require_credentials(self) -> None:
+        # Prefer App Secret from Redis registry (aliexpress:oauth:apps); .env is fallback.
+        from aliexpress_ds.app_registry import ensure_app_credentials
+
+        ensure_app_credentials(self)
+
         missing = []
         if not self.aliexpress_app_key or self.aliexpress_app_key.startswith("your_"):
             missing.append("ALIEXPRESS_APP_KEY")
         if not self.aliexpress_app_secret or self.aliexpress_app_secret.startswith("your_"):
-            missing.append("ALIEXPRESS_APP_SECRET")
+            missing.append(
+                "ALIEXPRESS_APP_SECRET (or register app in Redis aliexpress:oauth:apps)"
+            )
         # Token can come from Redis or env — check via resolve at call time.
         has_redis = bool((self.redis_url or "").strip())
         has_token = bool(
@@ -91,9 +98,10 @@ class Settings(BaseSettings):
             missing.append("REDIS_URL or ALIEXPRESS_ACCESS_TOKEN")
         if missing:
             raise ValueError(
-                "Missing credentials in .env: "
+                "Missing credentials: "
                 + ", ".join(missing)
-                + ". Fill App Key/Secret; token via Upstash REDIS_URL or ALIEXPRESS_ACCESS_TOKEN."
+                + ". Set ALIEXPRESS_APP_KEY + REDIS_URL (secret/token in Redis) "
+                "or ALIEXPRESS_APP_SECRET / ALIEXPRESS_ACCESS_TOKEN in .env."
             )
 
     def require_es(self) -> None:

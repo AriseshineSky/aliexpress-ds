@@ -126,6 +126,17 @@ def load_token_from_redis(settings: Settings | None = None) -> dict[str, Any] | 
             continue
         if isinstance(data, dict) and str(data.get("access_token") or "").strip():
             if key != primary:
+                # Multi-app: never reuse another AppKey's token from the legacy key.
+                token_app = str(data.get("app_key") or "").strip()
+                expected = (settings.aliexpress_app_key or "").strip()
+                if token_app and expected and token_app != expected:
+                    logger.warning(
+                        "Skipping legacy Redis key %s (app_key=%s != %s)",
+                        key,
+                        token_app,
+                        expected,
+                    )
+                    continue
                 logger.info("Loaded OAuth token from legacy Redis key %s (prefer %s)", key, primary)
             else:
                 logger.debug("Loaded OAuth token from Redis %s", key)
@@ -325,8 +336,12 @@ def ensure_fresh_token(settings: Settings | None = None) -> dict[str, Any]:
     """Return usable token dict; refresh via API when access_token is near expiry.
 
     Uses an in-process memory cache so hot paths skip Upstash on every call.
+    Writes refreshed tokens back to ``aliexpress:oauth:token:{app_key}``.
     """
     settings = settings or get_settings()
+    from aliexpress_ds.app_registry import ensure_app_credentials
+
+    ensure_app_credentials(settings)
     cached = _memory_get(settings)
     if cached is not None:
         return cached
