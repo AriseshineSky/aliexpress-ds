@@ -1828,9 +1828,9 @@ def enqueue_es(
         help="sold_count >= this (default: ENQUEUE_MIN_SOLD_COUNT)",
     ),
     sort_by: str = typer.Option(
-        "rating,desc",
+        "reviews,desc",
         "--sort-by",
-        help="Sort candidates before LPUSH: rating,desc|rating,asc|none",
+        help="Sort candidates before LPUSH: reviews,desc|rating,desc|none",
     ),
     category_blacklist: bool | None = typer.Option(
         None,
@@ -1993,9 +1993,11 @@ def enqueue_es(
                 return float("-inf") if reverse else float("inf")
 
         pending.sort(key=_sort_val, reverse=reverse)
+        top = pending[0] if pending else {}
         console.print(
             f"Sorted by {field} {'desc' if reverse else 'asc'} "
-            f"(top rating sample={pending[0].get('rating') if pending else '-'})"
+            f"(top sample {field}={top.get(field, '-')} "
+            f"rating={top.get('rating', '-')} reviews={top.get('reviews', '-')})"
         )
 
     if limit and limit > 0:
