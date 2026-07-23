@@ -155,15 +155,20 @@ class ProductQueue:
         *,
         force: bool = False,
         batch_size: int = 1000,
+        priority: bool = False,
     ) -> tuple[int, int]:
         """Enqueue list of {product_id, url?, source?}. Returns (new, skipped).
 
         Uses Redis pipelines so mass re-queue (100k+) finishes in minutes.
+
+        priority=True uses RPUSH so BRPOP picks these jobs before older LPUSH
+        backlog (worker uses BRPOP = pop from right).
         """
         new = 0
         skipped = 0
         batch_size = max(100, int(batch_size))
         buf: list[tuple[str, str]] = []  # (pid, payload)
+        push_cmd = "rpush" if priority else "lpush"
 
         def _flush(chunk: list[tuple[str, str]]) -> None:
             nonlocal new, skipped
@@ -177,7 +182,7 @@ class ProductQueue:
                 pipe.execute()
                 pipe = self.client.pipeline(transaction=False)
                 for _pid, payload in chunk:
-                    pipe.lpush(self.queue_key, payload)
+                    getattr(pipe, push_cmd)(self.queue_key, payload)
                 pipe.execute()
                 new += len(chunk)
                 return
@@ -191,7 +196,7 @@ class ProductQueue:
             pushed = 0
             for (pid, payload), flag in zip(chunk, sadd_flags, strict=True):
                 if int(flag or 0) == 1:
-                    pipe.lpush(self.queue_key, payload)
+                    getattr(pipe, push_cmd)(self.queue_key, payload)
                     pushed += 1
                 else:
                     skipped += 1

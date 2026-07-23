@@ -83,6 +83,32 @@ def urls_quality_query(
     return {"bool": {"must": must}}
 
 
+def urls_missing_fields_query(
+    *,
+    max_price: float | None = None,
+) -> dict[str, Any]:
+    """URLs missing rating / reviews / sold_count (any one) — lower enqueue priority.
+
+    Used after the quality-pass batch so incomplete listing docs still get fetched,
+    but only after docs that already clear the quality gates.
+    """
+    must: list[dict[str, Any]] = [{"exists": {"field": "product_id"}}]
+    if max_price is not None and max_price > 0:
+        must.append({"range": {"price": {"gt": 0, "lt": float(max_price)}}})
+    should: list[dict[str, Any]] = [
+        {"bool": {"must_not": [{"exists": {"field": "rating"}}]}},
+        {"bool": {"must_not": [{"exists": {"field": "reviews"}}]}},
+        {"bool": {"must_not": [{"exists": {"field": "sold_count"}}]}},
+    ]
+    return {
+        "bool": {
+            "must": must,
+            "should": should,
+            "minimum_should_match": 1,
+        }
+    }
+
+
 def load_existing_product_ids(es: Elasticsearch, products_index: str) -> set[str]:
     ids: set[str] = set()
     for doc in scroll_sources(es, products_index, source_fields=["product_id", "sku", "url"]):
@@ -109,15 +135,24 @@ def list_missing_urls(
     min_reviews: int | None = None,
     min_sold_count: int | None = None,
     quality_filter: bool = False,
+    missing_fields_only: bool = False,
+    exclude_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Load pending URLs into memory so scroll finishes before slow API calls.
 
     When ``quality_filter`` is True, apply listing gates on urls-index fields
     (price / rating / reviews / sold_count) via ES query.
+
+    When ``missing_fields_only`` is True, select docs missing rating / reviews /
+    sold_count (any). Mutually exclusive with ``quality_filter`` — if both are
+    set, ``missing_fields_only`` wins.
     """
     existing = existing_ids if existing_ids is not None else load_existing_product_ids(es, products_index)
+    skip = exclude_ids or set()
     query: dict[str, Any] | None = None
-    if quality_filter:
+    if missing_fields_only:
+        query = urls_missing_fields_query(max_price=max_price)
+    elif quality_filter:
         query = urls_quality_query(
             max_price=max_price,
             min_rating=min_rating,
@@ -143,7 +178,7 @@ def list_missing_urls(
         query=query,
     ):
         pid = str(doc.get("product_id") or "").strip()
-        if not pid or pid in existing:
+        if not pid or pid in existing or pid in skip:
             continue
         url = doc.get("url") or f"https://www.aliexpress.us/item/{pid}.html"
         missing.append(
@@ -174,6 +209,8 @@ def iter_missing_urls(
     min_reviews: int | None = None,
     min_sold_count: int | None = None,
     quality_filter: bool = False,
+    missing_fields_only: bool = False,
+    exclude_ids: set[str] | None = None,
 ) -> Iterator[dict[str, Any]]:
     yield from list_missing_urls(
         es,
@@ -185,6 +222,8 @@ def iter_missing_urls(
         min_reviews=min_reviews,
         min_sold_count=min_sold_count,
         quality_filter=quality_filter,
+        missing_fields_only=missing_fields_only,
+        exclude_ids=exclude_ids,
     )
 
 

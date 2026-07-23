@@ -401,9 +401,16 @@ def refresh_token_cmd(
 
 
 @app.command("feed-names")
-def feed_names() -> None:
-    """List available DS recommend feed names."""
-    from aliexpress_ds.feed import FeedService
+def feed_names(
+    bestsellers_only: bool = typer.Option(
+        False,
+        "--bestsellers-only",
+        help="Only print feed names containing 'bestseller'",
+    ),
+    limit: int = typer.Option(40, "--limit", help="Max rows to print (0 = all)"),
+) -> None:
+    """List available DS recommend feed / promo names (aliexpress.ds.feedname.get)."""
+    from aliexpress_ds.feed import FeedService, parse_feed_promos
     from aliexpress_ds.iop_client import IopError
 
     try:
@@ -413,7 +420,17 @@ def feed_names() -> None:
         if isinstance(exc, IopError) and exc.body is not None:
             err_console.print_json(data=exc.body)
         raise typer.Exit(code=1) from exc
-    console.print_json(data=payload)
+
+    rows = parse_feed_promos(payload)
+    if bestsellers_only:
+        rows = [r for r in rows if "bestseller" in r["name"].lower()]
+    console.print(f"feeds={len(rows)}")
+    show = rows if limit <= 0 else rows[:limit]
+    for row in show:
+        n = row.get("product_num")
+        console.print(f"  {(n if n is not None else '-'):>8}  {row['name']}")
+    if limit > 0 and len(rows) > limit:
+        console.print(f"  … {len(rows) - limit} more (use --limit 0)")
 
 
 @app.command("categories")
@@ -543,14 +560,24 @@ def sync_categories(
 
 @app.command("discover-feed")
 def discover_feed(
-    feed_name: str = typer.Option("DS bestseller", "--feed-name", "-f"),
+    feed_name: str = typer.Option(
+        "AEB_Droplo_BestsellersItems_20241016",
+        "--feed-name",
+        "-f",
+        help="Promo/feed name from `feed-names` (not the dead 'DS bestseller')",
+    ),
     category_id: Optional[str] = typer.Option(
         None,
         "--category-id",
         "-C",
-        help="AE category id from `categories` command (optional filter)",
+        help="DS category_id filter (works well with Droplo bestsellers)",
     ),
-    pages: int = typer.Option(2, "--pages", "-p", help="How many pages to pull"),
+    pages: int = typer.Option(
+        20,
+        "--pages",
+        "-p",
+        help="Max pages (stops early when is_finished / empty)",
+    ),
     page_size: int = typer.Option(50, "--page-size", help="1-50"),
     sort: str = typer.Option(
         "volumeDesc",
@@ -572,9 +599,18 @@ def discover_feed(
     """Discover products via DS recommend feed (NOT free-text keyword search).
 
     Official Dropshipping discovery: aliexpress.ds.recommend.feed.get
-    Affiliate keyword search needs separate Affiliate API permission (your app currently lacks it).
+
+    Example — bestsellers under Beauty (category 66), paginate up to 50 pages::
+
+        uv run aliexpress-ds discover-feed -f AEB_Droplo_BestsellersItems_20241016 \\
+          -C 66 -p 50 --sort volumeDesc --write-es
     """
-    from aliexpress_ds.feed import FeedService, extract_products, product_to_url_doc
+    from aliexpress_ds.feed import (
+        FeedService,
+        extract_feed_meta,
+        extract_products,
+        product_to_url_doc,
+    )
     from aliexpress_ds.rate_limit import RateLimiter
 
     settings = get_settings()
@@ -614,16 +650,24 @@ def discover_feed(
                 break
 
             products = extract_products(payload)
-            console.print(f"page {page}: {len(products)} products")
+            meta = extract_feed_meta(payload)
+            console.print(
+                f"page {page}: {len(products)} products "
+                f"(total≈{meta.get('total_record_count')} finished={meta.get('is_finished')})"
+            )
             if not products:
                 break
             for product in products:
-                doc = product_to_url_doc(product)
+                doc = product_to_url_doc(
+                    product, feed_name=feed_name, category_id=category_id
+                )
                 if not doc or doc["product_id"] in seen:
                     continue
                 seen.add(doc["product_id"])
                 docs.append(doc)
                 fh.write(json.dumps(doc, ensure_ascii=False) + "\n")
+            if meta.get("is_finished"):
+                break
 
     indexed = 0
     if write_es and docs:
@@ -632,6 +676,427 @@ def discover_feed(
 
     console.print(
         f"[green]Done[/green] discovered={len(docs)} es_indexed={indexed} → {output}"
+    )
+
+
+@app.command("discover-feed-loop")
+def discover_feed_loop(
+    feed_name: Optional[list[str]] = typer.Option(
+        None,
+        "--feed-name",
+        "-f",
+        help="Feed/promo name (repeatable). Default: Droplo bestsellers + DS_*_bestsellers",
+    ),
+    category_id: Optional[list[str]] = typer.Option(
+        None,
+        "--category-id",
+        "-C",
+        help="Category id to filter (repeatable). Default: priority L1 list",
+    ),
+    priority_categories: bool = typer.Option(
+        True,
+        "--priority-categories/--no-priority-categories",
+        help="When -C omitted, use PRIORITY_FEED_CATEGORY_IDS (Automotive/Beauty/…)",
+    ),
+    bestsellers_only: bool = typer.Option(
+        True,
+        "--bestsellers-only/--all-default-feeds",
+        help="If no -f: include only default bestseller feed names",
+    ),
+    pages_per_job: int = typer.Option(
+        200,
+        "--pages-per-job",
+        "-p",
+        help="Max pages per (feed, category) pair; stops early on is_finished/empty",
+    ),
+    page_size: int = typer.Option(50, "--page-size", help="1-50"),
+    sort: str = typer.Option("volumeDesc", "--sort"),
+    country: str = typer.Option("US", "--country", "-c"),
+    min_interval: float = typer.Option(
+        2.0,
+        "--min-interval",
+        help="Seconds between API calls",
+    ),
+    flush_every: int = typer.Option(100, "--flush-every"),
+    checkpoint: Path = typer.Option(
+        Path("data/discover_feed_checkpoint.json"),
+        "--checkpoint",
+    ),
+    write_es: bool = typer.Option(True, "--write-es/--no-write-es"),
+    output: Path = typer.Option(
+        Path("data/discovered_feed_urls.jsonl"),
+        "--output",
+        "-o",
+    ),
+) -> None:
+    """Paginate recommend.feed across feeds × categories → ES urls (补漏).
+
+    Meaning: official curated pools (bestsellers etc.) filtered by category_id,
+    page_no=1..N until finished. Complements text.search and link-crawler.
+
+    Example::
+
+        uv run aliexpress-ds discover-feed-loop --pages-per-job 100 --write-es
+        uv run aliexpress-ds discover-feed-loop -f AEB_Droplo_BestsellersItems_20241016 -C 66 -C 34
+    """
+    from aliexpress_ds.feed import (
+        DEFAULT_BESTSELLER_FEEDS,
+        PRIORITY_FEED_CATEGORY_IDS,
+        FeedService,
+        extract_feed_meta,
+        extract_products,
+        product_to_url_doc,
+    )
+    from aliexpress_ds.rate_limit import RateLimiter
+
+    settings = get_settings()
+    try:
+        settings.require_credentials()
+        if write_es:
+            settings.require_es()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    feeds = [f.strip() for f in (feed_name or []) if f and f.strip()]
+    if not feeds:
+        feeds = list(DEFAULT_BESTSELLER_FEEDS) if bestsellers_only else list(
+            DEFAULT_BESTSELLER_FEEDS
+        )
+
+    cats: list[str | None]
+    if category_id:
+        cats = [c.strip() for c in category_id if c and str(c).strip()]
+    elif priority_categories:
+        cats = list(dict.fromkeys(PRIORITY_FEED_CATEGORY_IDS.values()))
+    else:
+        cats = [None]
+
+    # Jobs: for named DS_*_bestsellers feeds, category filter is optional (feed
+    # already scoped). Still run once with category=None. For Droplo (huge pool),
+    # always pair with each category_id.
+    jobs: list[tuple[str, str | None]] = []
+    for fname in feeds:
+        is_droplo = "droplo" in fname.lower() or fname.startswith("AEB_")
+        if is_droplo:
+            for cid in cats:
+                jobs.append((fname, cid))
+        else:
+            # category-scoped DS_* feed — no extra category_id needed
+            jobs.append((fname, None))
+            # also try priority cats if user explicitly passed -C
+            if category_id:
+                for cid in cats:
+                    jobs.append((fname, cid))
+
+    # de-dupe jobs
+    seen_jobs: set[tuple[str, str | None]] = set()
+    uniq_jobs: list[tuple[str, str | None]] = []
+    for job in jobs:
+        if job in seen_jobs:
+            continue
+        seen_jobs.add(job)
+        uniq_jobs.append(job)
+    jobs = uniq_jobs
+
+    state: dict = {"done_jobs": [], "unique": 0, "api_calls": 0}
+    if checkpoint.exists():
+        try:
+            state.update(json.loads(checkpoint.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    done_set = {tuple(x) if isinstance(x, list) else tuple(x) for x in state.get("done_jobs") or []}
+    # normalize done entries to (feed, cat|None)
+    normalized_done: set[tuple[str, str | None]] = set()
+    for item in done_set:
+        if not item:
+            continue
+        if len(item) == 1:
+            normalized_done.add((str(item[0]), None))
+        else:
+            normalized_done.add((str(item[0]), item[1] if item[1] is not None else None))
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    limiter = RateLimiter(
+        min_interval_sec=float(min_interval),
+        daily_limit=settings.aliexpress_daily_limit,
+        state_path=Path("data/rate_limit_state.json"),
+    )
+    service = FeedService(client=IopClient(limiter=limiter))
+    es = make_es_client(settings) if write_es else None
+    buffer: list[dict] = []
+    global_seen: set[str] = set()
+    total_indexed = 0
+    total_new = int(state.get("unique") or 0)
+
+    def flush() -> None:
+        nonlocal total_indexed, buffer
+        if not buffer:
+            return
+        if es is not None:
+            total_indexed += upsert_url_docs(es, settings.es_urls_index, buffer)
+        buffer = []
+
+    def save_ckpt() -> None:
+        state["unique"] = total_new
+        state["api_calls"] = int(state.get("api_calls") or 0)
+        state["done_jobs"] = [list(x) for x in sorted(normalized_done, key=lambda t: (t[0], t[1] or ""))]
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    console.print(
+        f"discover-feed-loop jobs={len(jobs)} feeds={len(feeds)} "
+        f"cats={len(cats)} pages≤{pages_per_job} sort={sort}"
+    )
+
+    with output.open("a", encoding="utf-8") as fh:
+        for fname, cid in jobs:
+            key = (fname, cid)
+            if key in normalized_done:
+                console.print(f"[dim]skip done[/dim] {fname} cat={cid or '-'}")
+                continue
+            console.print(f"\n[bold]feed[/bold]={fname}  category={cid or '-'}")
+            page_new = 0
+            for page in range(1, max(int(pages_per_job), 1) + 1):
+                try:
+                    payload = service.recommend(
+                        feed_name=fname,
+                        category_id=cid,
+                        country=country,
+                        page_no=page,
+                        page_size=page_size,
+                        sort=sort,
+                    )
+                except (ValueError, IopError, DailyQuotaExhausted, RuntimeError) as exc:
+                    err_console.print(f"[red]{fname} p{page}:[/red] {exc}")
+                    if isinstance(exc, DailyQuotaExhausted):
+                        flush()
+                        save_ckpt()
+                        raise typer.Exit(code=2) from exc
+                    break
+
+                state["api_calls"] = int(state.get("api_calls") or 0) + 1
+                products = extract_products(payload)
+                meta = extract_feed_meta(payload)
+                kept = 0
+                for product in products:
+                    doc = product_to_url_doc(product, feed_name=fname, category_id=cid)
+                    if not doc:
+                        continue
+                    pid = doc["product_id"]
+                    if pid in global_seen:
+                        continue
+                    global_seen.add(pid)
+                    # slim for ES (drop huge raw if desired — keep for now, upsert handles)
+                    slim = {k: v for k, v in doc.items() if k != "raw_feed"}
+                    slim["raw_feed"] = {
+                        k: product.get(k)
+                        for k in (
+                            "evaluate_rate",
+                            "lastest_volume",
+                            "first_level_category_id",
+                            "second_level_category_id",
+                            "target_sale_price",
+                        )
+                        if k in product
+                    }
+                    buffer.append(slim)
+                    fh.write(json.dumps(slim, ensure_ascii=False) + "\n")
+                    kept += 1
+                    total_new += 1
+                    page_new += 1
+                    if len(buffer) >= flush_every:
+                        flush()
+                        save_ckpt()
+
+                console.print(
+                    f"  p{page}: got={len(products)} new={kept} "
+                    f"total≈{meta.get('total_record_count')} "
+                    f"finished={meta.get('is_finished')} unique={total_new}"
+                )
+                if not products or meta.get("is_finished"):
+                    break
+                if kept == 0 and page > 3:
+                    # pagination repeating — stop this job
+                    console.print("  [dim]no new ids — next job[/dim]")
+                    break
+
+            normalized_done.add(key)
+            flush()
+            save_ckpt()
+            console.print(f"  job done new={page_new}")
+
+    flush()
+    save_ckpt()
+    console.print(
+        f"[green]Done[/green] unique≈{total_new} es_indexed={total_indexed} "
+        f"api_calls={state.get('api_calls')} → {output}"
+    )
+
+
+@app.command("bestsellers-daily")
+def bestsellers_daily(
+    pages_per_job: int = typer.Option(
+        200,
+        "--pages-per-job",
+        "-p",
+        help="Max feed pages per (feed, category) during sync",
+    ),
+    page_size: int = typer.Option(50, "--page-size"),
+    sort: str = typer.Option("volumeDesc", "--sort"),
+    country: str = typer.Option("US", "--country", "-c"),
+    skip_sync: bool = typer.Option(
+        False,
+        "--skip-sync",
+        help="Do not call recommend.feed; only check/enqueue/report from ES tags",
+    ),
+    enqueue_missing: bool = typer.Option(
+        True,
+        "--enqueue-missing/--no-enqueue-missing",
+        help="RPUSH missing product_ids to Redis queue (priority)",
+    ),
+    force_enqueue: bool = typer.Option(
+        True,
+        "--force-enqueue/--no-force-enqueue",
+        help="Re-queue even if id is already in Redis seen set",
+    ),
+    reports_dir: Path = typer.Option(
+        Path("reports"),
+        "--reports-dir",
+        help="Where to write bestsellers_YYYYMMDD.md/json",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Sync/check/report only; do not push Redis",
+    ),
+) -> None:
+    """Daily bestsellers job: sync feed → mark ES → enqueue unfetched → report.
+
+    1) Pull recommend.feed bestsellers (Droplo + DS_*_bestsellers × priority cats)
+    2) Upsert urls with is_bestseller / tags=bestseller / bestseller_synced_at
+    3) Diff against ES_PRODUCTS_INDEX; missing ids → priority Redis queue (RPUSH)
+    4) Write rating/reviews/sold_count distribution report under reports/
+    """
+    from aliexpress_ds.bestsellers import (
+        build_bestseller_jobs,
+        distribution_report,
+        make_feed_service,
+        partition_fetched,
+        scroll_bestseller_urls,
+        sync_bestsellers_from_feed,
+        upsert_marked_batch,
+        write_report,
+    )
+    from aliexpress_ds.queue import get_product_queue
+    from aliexpress_ds.rate_limit import RateLimiter
+
+    settings = get_settings()
+    try:
+        settings.require_es()
+        if not skip_sync:
+            settings.require_credentials()
+        if enqueue_missing and not dry_run:
+            settings.require_queue_redis()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    es = make_es_client(settings)
+    synced_stats: dict = {"skipped": True} if skip_sync else {}
+
+    if not skip_sync:
+        limiter = RateLimiter(
+            min_interval_sec=settings.aliexpress_min_interval_sec,
+            daily_limit=settings.aliexpress_daily_limit,
+            state_path=Path("data/rate_limit_state.json"),
+        )
+        iop = IopClient(limiter=limiter)
+        service = make_feed_service(iop)
+        jobs = build_bestseller_jobs()
+        console.print(f"Syncing bestsellers: jobs={len(jobs)} pages≤{pages_per_job}")
+        indexed = 0
+
+        def _on_batch(docs: list[dict]) -> None:
+            nonlocal indexed
+            n = upsert_marked_batch(es, settings.es_urls_index, docs)
+            indexed += n
+            console.print(f"  upserted batch={n} total_indexed≈{indexed}")
+
+        try:
+            synced_stats = sync_bestsellers_from_feed(
+                service,
+                jobs=jobs,
+                pages_per_job=pages_per_job,
+                page_size=page_size,
+                sort=sort,
+                country=country,
+                on_batch=_on_batch,
+            )
+        except DailyQuotaExhausted as exc:
+            err_console.print(f"[red]daily quota:[/red] {exc}")
+            synced_stats["error"] = str(exc)
+        synced_stats["es_indexed"] = indexed
+        console.print(
+            f"[green]Sync done[/green] unique={synced_stats.get('unique_ids')} "
+            f"api_calls={synced_stats.get('api_calls')} es_indexed={indexed}"
+        )
+        try:
+            es.indices.refresh(index=settings.es_urls_index)
+        except Exception:
+            pass
+
+    console.print("Loading bestseller urls from ES …")
+    bestsellers = scroll_bestseller_urls(es, settings.es_urls_index)
+    console.print(f"Bestsellers tagged in urls: {len(bestsellers)}")
+
+    console.print("Loading existing product_ids from products index …")
+    existing = load_existing_product_ids(es, settings.es_products_index)
+    missing, fetched = partition_fetched(bestsellers, existing)
+    console.print(
+        f"Fetched={len(fetched)}  Missing={len(missing)}  "
+        f"(products_index size≈{len(existing)})"
+    )
+
+    enqueued = 0
+    skipped_q = 0
+    if enqueue_missing and missing and not dry_run:
+        q = get_product_queue(settings)
+        # Priority: RPUSH so BRPOP takes these before older LPUSH backlog
+        items = [
+            {
+                "product_id": d.get("product_id"),
+                "url": d.get("url"),
+                "source": d.get("source") or "aliexpress.us",
+                "priority_reason": "bestseller_missing",
+                "bestseller_feed": d.get("bestseller_feed"),
+            }
+            for d in missing
+            if d.get("product_id")
+        ]
+        enqueued, skipped_q = q.enqueue_many(
+            items, force=force_enqueue, priority=True
+        )
+        console.print(
+            f"[green]Priority enqueue[/green] new={enqueued} skipped={skipped_q} "
+            f"(force={force_enqueue})"
+        )
+    elif dry_run and missing:
+        console.print(f"[dim]dry-run: would priority-enqueue {len(missing)}[/dim]")
+
+    report = distribution_report(
+        bestsellers,
+        missing_count=len(missing),
+        fetched_count=len(fetched),
+        enqueued=enqueued,
+        synced_stats=synced_stats,
+    )
+    json_path, md_path = write_report(report, reports_dir)
+    console.print(f"Report → {md_path}")
+    console.print(f"Report → {json_path}")
+    console.print(
+        f"[green]Done[/green] bestsellers={len(bestsellers)} "
+        f"missing={len(missing)} enqueued={enqueued}"
     )
 
 
@@ -1788,7 +2253,7 @@ def rate_status() -> None:
 
 @app.command("enqueue-es")
 def enqueue_es(
-    limit: int = typer.Option(0, "--limit", "-n", help="Max product_ids to enqueue (0 = all)"),
+    limit: int = typer.Option(0, "--limit", "-n", help="Max quality-pass product_ids (0 = all)"),
     force: bool = typer.Option(
         False,
         "--force",
@@ -1806,6 +2271,19 @@ def enqueue_es(
             "Filter urls by price/rating/reviews/sold_count "
             "(default: ENQUEUE_QUALITY_FILTER from .env)"
         ),
+    ),
+    include_missing_fields: bool | None = typer.Option(
+        None,
+        "--include-missing-fields/--no-include-missing-fields",
+        help=(
+            "After quality-pass batch, append urls missing rating/reviews/sold "
+            "(default: ENQUEUE_INCLUDE_MISSING_FIELDS)"
+        ),
+    ),
+    missing_limit: int = typer.Option(
+        0,
+        "--missing-limit",
+        help="Max missing-field ids to append (0 = all)",
     ),
     max_price: float | None = typer.Option(
         None,
@@ -1830,7 +2308,7 @@ def enqueue_es(
     sort_by: str = typer.Option(
         "reviews,desc",
         "--sort-by",
-        help="Sort candidates before LPUSH: reviews,desc|rating,desc|none",
+        help="Sort quality candidates before LPUSH: reviews,desc|rating,desc|none",
     ),
     category_blacklist: bool | None = typer.Option(
         None,
@@ -1850,6 +2328,10 @@ def enqueue_es(
       - not yet in ``user1_aliexpress_us_products``
       - passes quality gates (price/rating/reviews/sold) when enabled
       - not in category blacklist (clothing / adult) when enabled
+
+    When quality filter is on and ``--include-missing-fields`` (default), urls
+    missing rating/reviews/sold_count are appended after the quality-pass batch
+    so workers finish higher-quality jobs first (LPUSH+BRPOP order).
     """
     from aliexpress_ds.category_blacklist import filter_items_by_category_blacklist
     from aliexpress_ds.queue import get_product_queue
@@ -1866,6 +2348,11 @@ def enqueue_es(
     use_quality = (
         settings.enqueue_quality_filter if quality_filter is None else quality_filter
     )
+    use_missing_fields = (
+        settings.enqueue_include_missing_fields
+        if include_missing_fields is None
+        else include_missing_fields
+    )
     use_category_blacklist = (
         settings.enqueue_category_blacklist
         if category_blacklist is None
@@ -1877,6 +2364,47 @@ def enqueue_es(
     q_min_sold = (
         settings.enqueue_min_sold_count if min_sold_count is None else min_sold_count
     )
+
+    def _apply_blacklist(items: list[dict], label: str) -> list[dict]:
+        if not use_category_blacklist:
+            return items
+        before = len(items)
+        filtered, blocked = filter_items_by_category_blacklist(
+            items,
+            blacklist_file=settings.enqueue_category_blacklist_file,
+            env_keywords=os.environ.get("ENQUEUE_CATEGORY_BLACKLIST_KEYWORDS", ""),
+        )
+        console.print(
+            f"Category blacklist ({label}) removed {blocked} "
+            f"(before={before} after={len(filtered)})"
+        )
+        return filtered
+
+    def _apply_sort(items: list[dict]) -> list[dict]:
+        sort_key = (sort_by or "none").strip().lower()
+        if sort_key in {"", "none", "-"} or not items:
+            return items
+        field, _, direction = sort_key.partition(",")
+        field = field.strip() or "rating"
+        reverse = (direction.strip() or "desc").lower() != "asc"
+
+        def _sort_val(item: dict) -> float:
+            raw = item.get(field)
+            try:
+                if raw is None or raw == "":
+                    return float("-inf") if reverse else float("inf")
+                return float(raw)
+            except (TypeError, ValueError):
+                return float("-inf") if reverse else float("inf")
+
+        items.sort(key=_sort_val, reverse=reverse)
+        top = items[0]
+        console.print(
+            f"Sorted by {field} {'desc' if reverse else 'asc'} "
+            f"(top sample {field}={top.get(field, '-')} "
+            f"rating={top.get('rating', '-')} reviews={top.get('reviews', '-')})"
+        )
+        return items
 
     console.print("Connecting ES …")
     es = make_es_client(settings)
@@ -1894,6 +2422,14 @@ def enqueue_es(
     else:
         console.print("Quality filter OFF")
 
+    if use_quality and use_missing_fields:
+        console.print(
+            "Missing-fields batch ON (append after quality: "
+            "no rating / reviews / sold_count)"
+        )
+    elif use_quality:
+        console.print("Missing-fields batch OFF")
+
     if use_category_blacklist:
         console.print(
             "Category blacklist ON (skip 服装 / 成人用品 — "
@@ -1902,7 +2438,7 @@ def enqueue_es(
     else:
         console.print("Category blacklist OFF")
 
-    console.print(f"Scanning {settings.es_urls_index} for candidates …")
+    console.print(f"Scanning {settings.es_urls_index} for quality candidates …")
     if skip_existing_products:
         pending = list(
             iter_missing_urls(
@@ -1964,46 +2500,41 @@ def enqueue_es(
                 }
             )
 
-    before_blacklist = len(pending)
-    blocked_category = 0
-    if use_category_blacklist:
-        pending, blocked_category = filter_items_by_category_blacklist(
-            pending,
-            blacklist_file=settings.enqueue_category_blacklist_file,
-            env_keywords=os.environ.get("ENQUEUE_CATEGORY_BLACKLIST_KEYWORDS", ""),
-        )
-        console.print(
-            f"Category blacklist removed {blocked_category} "
-            f"(before={before_blacklist} after={len(pending)})"
-        )
-
-    sort_key = (sort_by or "none").strip().lower()
-    if sort_key not in {"", "none", "-"}:
-        field, _, direction = sort_key.partition(",")
-        field = field.strip() or "rating"
-        reverse = (direction.strip() or "desc").lower() != "asc"
-
-        def _sort_val(item: dict) -> float:
-            raw = item.get(field)
-            try:
-                if raw is None or raw == "":
-                    return float("-inf") if reverse else float("inf")
-                return float(raw)
-            except (TypeError, ValueError):
-                return float("-inf") if reverse else float("inf")
-
-        pending.sort(key=_sort_val, reverse=reverse)
-        top = pending[0] if pending else {}
-        console.print(
-            f"Sorted by {field} {'desc' if reverse else 'asc'} "
-            f"(top sample {field}={top.get(field, '-')} "
-            f"rating={top.get('rating', '-')} reviews={top.get('reviews', '-')})"
-        )
-
+    pending = _apply_blacklist(pending, "quality")
+    pending = _apply_sort(pending)
     if limit and limit > 0:
         pending = pending[:limit]
+    quality_count = len(pending)
+    console.print(f"Quality candidates: {quality_count}")
 
-    console.print(f"Candidates to enqueue: {len(pending)}")
+    missing_pending: list[dict] = []
+    if use_quality and use_missing_fields and skip_existing_products:
+        console.print(
+            f"Scanning {settings.es_urls_index} for missing-field candidates …"
+        )
+        quality_ids = {str(x["product_id"]) for x in pending}
+        missing_pending = list(
+            iter_missing_urls(
+                es,
+                urls_index=settings.es_urls_index,
+                products_index=settings.es_products_index,
+                existing_ids=existing,
+                missing_fields_only=True,
+                max_price=q_max_price,
+                exclude_ids=quality_ids,
+            )
+        )
+        missing_pending = _apply_blacklist(missing_pending, "missing-fields")
+        if missing_limit and missing_limit > 0:
+            missing_pending = missing_pending[:missing_limit]
+        console.print(f"Missing-field candidates (queue back): {len(missing_pending)}")
+
+    # Quality first, missing last → LPUSH order → BRPOP processes quality first.
+    pending = pending + missing_pending
+    console.print(
+        f"Candidates to enqueue: {len(pending)} "
+        f"(quality={quality_count} missing_fields={len(missing_pending)})"
+    )
     if dry_run:
         console.print("[yellow]dry-run[/yellow] — not writing to Redis")
         for item in pending[:10]:
@@ -2020,6 +2551,7 @@ def enqueue_es(
     new, skipped = q.enqueue_many(pending, force=force)
     console.print(
         f"[green]Enqueued[/green] new={new} skipped={skipped} "
+        f"quality={quality_count} missing_fields={len(missing_pending)} "
         f"queue_len={q.length()} seen={q.seen_count()} "
         f"→ {settings.redis_queue_key}"
     )

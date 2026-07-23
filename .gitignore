@@ -15,6 +15,7 @@ wheels/
 
 # Local run artifacts / probes
 data/
+reports/
 *.log
 
 # Cursor Playwright MCP snapshots

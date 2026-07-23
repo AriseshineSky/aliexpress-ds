@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic AliExpress DS enqueue-es (keep Redis queue fed)
+
+[Timer]
+# After boot, then every 2 hours while queue may drain
+OnBootSec=5min
+OnUnitActiveSec=2h
+AccuracySec=2min
+Persistent=true
+Unit=aliexpress-ds-enqueue.service
+
+[Install]
+WantedBy=timers.target

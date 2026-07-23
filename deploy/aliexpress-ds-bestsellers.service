@@ -1,0 +1,24 @@
+[Unit]
+Description=AliExpress DS daily bestsellers sync/check/enqueue/report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=Admin
+Group=Admin
+WorkingDirectory=/home/Admin/aliexpress-ds
+Environment=HOME=/home/Admin
+Environment=PATH=/home/Admin/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Sync recommend.feed bestsellers → mark ES → priority-enqueue missing → reports/
+ExecStart=/home/Admin/.local/bin/uv run aliexpress-ds bestsellers-daily --pages-per-job 200
+# Feed pagination can take a long time (Droplo × categories).
+TimeoutStartSec=21600
+Nice=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aliexpress-ds-bestsellers
+
+NoNewPrivileges=true
+PrivateTmp=true

@@ -1,0 +1,29 @@
+# Local inventory: which AliExpress AppKey runs on which VPS.
+# Rate is per-VPS via remote .env ALIEXPRESS_MIN_INTERVAL_SEC (not shared).
+# Update this file when you change host / app / pacing.
+# Secrets stay only on each VPS .env — never put app_secret / tokens here.
+
+vps:
+  - host: 34.172.204.102
+    ssh: Admin@34.172.204.102
+    label: mongo
+    remote_dir: /home/Admin/aliexpress-ds
+    app_key: "539674"
+    app_label: EverymarketSyncTool  # from local .env comment
+    min_interval_sec: 1.0            # ~1 QPS
+    daily_limit: 100000
+    queue_concurrency: 1
+    notes: "default DEPLOY_HOST in scripts/deploy_vps.sh"
+    updated_at: "2026-07-23"
+
+  - host: 35.202.167.107
+    ssh: Admin@35.202.167.107
+    label: ""
+    remote_dir: /home/Admin/aliexpress-ds
+    app_key: "539578"
+    app_label: ""
+    min_interval_sec: 2.0            # ~0.5 QPS (unchanged)
+    daily_limit: 100000
+    queue_concurrency: 1
+    notes: "DEPLOY_HOST=Admin@35.202.167.107 ./scripts/deploy_vps.sh"
+    updated_at: "2026-07-23"

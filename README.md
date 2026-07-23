@@ -32,13 +32,21 @@ uv run aliexpress-ds config-check
 uv run aliexpress-ds sync-categories \
   --yaml-out ../aliexpress-link-crawler/config/categories.priority.yaml
 
-# 列出 feed / 预览类目
-uv run aliexpress-ds feed-names
+# 列出 feed / 预览类目（bestsellers 池）
+uv run aliexpress-ds feed-names --bestsellers-only
 uv run aliexpress-ds categories
 
-# 按 feed + 可选类目分页发现，写入 URL 索引
-uv run aliexpress-ds discover-feed -f "DS bestseller" -C 66 --pages 20 --sort volumeDesc
+# 单 feed + 可选类目翻页 → ES urls（补漏）
+uv run aliexpress-ds discover-feed \
+  -f AEB_Droplo_BestsellersItems_20241016 -C 66 -p 50 --sort volumeDesc
 
+# 多 feed × 优先类目循环翻页（推荐，可断点续跑）
+uv run aliexpress-ds discover-feed-loop --pages-per-job 100 --write-es
+```
+
+`recommend.feed`：平台精选池（如 Droplo bestsellers / `DS_*_bestsellers`），用 `category_id` 收窄后再 `page_no` 翻页，直到 `is_finished`。用来补 keyword search / 爬虫没扫到的高销量商品。
+
+```bash
 # 关键词选品（官方 aliexpress.ds.text.search）— 指定类目目录，自动生成关键词海量拉 product_id
 uv run aliexpress-ds discover-search -C 66 --pages 5 --max-keywords 40 --write-es
 uv run aliexpress-ds discover-search -N "Beauty" --dry-run-keywords   # 只看生成的词
@@ -97,9 +105,11 @@ REDIS_QUEUE_SEEN_KEY=aliexpress-ds:products:seen
 
 ```bash
 # 1) 从 ES urls 入队（默认带质量过滤 + 排除已在 products 索引）
+#    质量过关的在前；缺 rating/reviews/sold 的自动追加到队列后面
 uv run aliexpress-ds enqueue-es
 uv run aliexpress-ds enqueue-es -n 500
 uv run aliexpress-ds enqueue-es --dry-run
+uv run aliexpress-ds enqueue-es --no-include-missing-fields   # 只要质量过关
 uv run aliexpress-ds queue-status
 
 # 覆盖阈值 / 关闭过滤
@@ -173,12 +183,21 @@ systemd：
 |------|------|
 | `aliexpress-ds-queue-worker.service` | 常驻监听 Redis 队列 |
 | `aliexpress-ds-token-refresh.timer` | 每小时确保 token 新鲜 |
+| `aliexpress-ds-enqueue.timer` | 每 2 小时从 ES urls 补灌 Redis 队列（默认只装在 mongo VPS） |
+| `aliexpress-ds-bestsellers.timer` | **每天**同步 bestsellers → 标记 → 缺详情优先入队 → 分布报告 |
 
 ```bash
 sudo systemctl status aliexpress-ds-queue-worker
 sudo journalctl -u aliexpress-ds-queue-worker -f
+sudo journalctl -u aliexpress-ds-enqueue -n 50
+sudo journalctl -u aliexpress-ds-bestsellers -n 100
 sudo systemctl list-timers 'aliexpress-ds*'
+# 手动跑一天任务（先 dry-run）
+cd /home/Admin/aliexpress-ds && uv run aliexpress-ds bestsellers-daily --dry-run
+uv run aliexpress-ds bestsellers-daily
 ```
+
+报告输出：`reports/bestsellers_YYYYMMDD.md` / `.json`（以及 `bestsellers_latest.*`）。
 
 ## 官方限流（AliExpress Open Service）
 

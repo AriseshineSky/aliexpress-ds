@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily AliExpress DS bestsellers job (06:30 America/Chicago)
+
+[Timer]
+# Run once daily; Persistent catches up after downtime
+OnCalendar=*-*-* 06:30:00
+# Timer runs in local timezone of the VPS (set Timedatectl). Prefer UTC VPS:
+# OnCalendar=*-*-* 11:30:00 UTC  ≈ 06:30 US Central (CST) / 12:30 UTC CDT adjust as needed.
+Persistent=true
+AccuracySec=5min
+Unit=aliexpress-ds-bestsellers.service
+
+[Install]
+WantedBy=timers.target

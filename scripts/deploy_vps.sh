@@ -99,19 +99,46 @@ if [[ "$SKIP_START" == "1" ]]; then
   exit 0
 fi
 
-echo "==> install systemd units (needs sudo)"
+# Install enqueue / bestsellers timers only on primary host (one feeder is enough).
+INSTALL_ENQUEUE_TIMER="${INSTALL_ENQUEUE_TIMER:-}"
+if [[ -z "$INSTALL_ENQUEUE_TIMER" ]]; then
+  if [[ "$HOST" == "Admin@34.172.204.102" || "$HOST" == *34.172.204.102* ]]; then
+    INSTALL_ENQUEUE_TIMER=1
+  else
+    INSTALL_ENQUEUE_TIMER=0
+  fi
+fi
+INSTALL_BESTSELLERS_TIMER="${INSTALL_BESTSELLERS_TIMER:-$INSTALL_ENQUEUE_TIMER}"
+
+echo "==> install systemd units (needs sudo; enqueue_timer=$INSTALL_ENQUEUE_TIMER bestsellers_timer=$INSTALL_BESTSELLERS_TIMER)"
 "${SSH[@]}" "$HOST" bash -s <<EOF
 set -euo pipefail
 sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-queue-worker.service" /etc/systemd/system/
 sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-token-refresh.service" /etc/systemd/system/
 sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-token-refresh.timer" /etc/systemd/system/
+sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-enqueue.service" /etc/systemd/system/
+sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-enqueue.timer" /etc/systemd/system/
+sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-bestsellers.service" /etc/systemd/system/
+sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-bestsellers.timer" /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now aliexpress-ds-token-refresh.timer
 sudo systemctl enable --now aliexpress-ds-queue-worker.service
 sudo systemctl restart aliexpress-ds-queue-worker.service
+if [[ "$INSTALL_ENQUEUE_TIMER" == "1" ]]; then
+  sudo systemctl enable --now aliexpress-ds-enqueue.timer
+else
+  sudo systemctl disable --now aliexpress-ds-enqueue.timer 2>/dev/null || true
+fi
+if [[ "$INSTALL_BESTSELLERS_TIMER" == "1" ]]; then
+  sudo systemctl enable --now aliexpress-ds-bestsellers.timer
+else
+  sudo systemctl disable --now aliexpress-ds-bestsellers.timer 2>/dev/null || true
+fi
 sudo systemctl status aliexpress-ds-queue-worker.service --no-pager -l | head -40
 sudo systemctl list-timers 'aliexpress-ds*' --no-pager
 EOF
 
 echo "==> done"
 echo "Logs: ssh $HOST 'sudo journalctl -u aliexpress-ds-queue-worker -f'"
+echo "Bestsellers: ssh $HOST 'sudo journalctl -u aliexpress-ds-bestsellers -n 100'"
+echo "Manual run: ssh $HOST 'cd $REMOTE_DIR && uv run aliexpress-ds bestsellers-daily --dry-run'"

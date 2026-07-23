@@ -1,0 +1,24 @@
+[Unit]
+Description=AliExpress DS enqueue-es (urls → Redis product queue)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=Admin
+Group=Admin
+WorkingDirectory=/home/Admin/aliexpress-ds
+Environment=HOME=/home/Admin
+Environment=PATH=/home/Admin/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Refill Redis queue from ES urls missing in products (quality + blacklist from .env).
+# Safe to run on one VPS only — seen-set dedupes if accidentally run twice.
+ExecStart=/home/Admin/.local/bin/uv run aliexpress-ds enqueue-es
+TimeoutStartSec=1800
+Nice=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aliexpress-ds-enqueue
+
+NoNewPrivileges=true
+PrivateTmp=true
