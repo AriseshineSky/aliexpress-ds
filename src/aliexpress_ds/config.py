@@ -52,10 +52,10 @@ class Settings(BaseSettings):
     enqueue_quality_filter: bool = True
     enqueue_max_price: float = 100.0
     enqueue_min_rating: float = 4.4
-    enqueue_min_reviews: int = 1000
-    enqueue_min_sold_count: int = 1000
-    # After quality-pass batch, also enqueue urls missing rating/reviews/sold
-    # (appended so workers finish quality jobs first). ENQUEUE_INCLUDE_MISSING_FIELDS=0 off.
+    enqueue_min_reviews: int = 300
+    enqueue_min_sold_count: int = 500
+    # After quality-pass batch, also enqueue remaining not-in-products URLs
+    # (reviews DESC). ENQUEUE_INCLUDE_MISSING_FIELDS=0 → quality-only.
     enqueue_include_missing_fields: bool = True
 
     # Category blacklist for enqueue-es (skip clothing / adult products).

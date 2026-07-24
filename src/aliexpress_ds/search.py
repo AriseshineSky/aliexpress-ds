@@ -7,6 +7,7 @@ category / selection and keywords, returns product_ids for the urls index.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from aliexpress_ds.iop_client import IopClient
@@ -240,6 +241,7 @@ def search_product_to_url_doc(
         if rating is not None and rating > 5.0:
             # convert percent-like to 0–5 scale used by urls index
             rating = round(rating / 20.0, 2)
+    now = datetime.now(timezone.utc).isoformat()
     return {
         "product_id": pid,
         "url": url,
@@ -248,7 +250,10 @@ def search_product_to_url_doc(
         "category": category_path or category_id or product.get("cateId") or product.get("cate_id"),
         "price": price,
         "rating": rating,
+        # text.search exposes order volume as ``orders`` (no reviews field)
         "sold_count": _to_int(product.get("orders") or product.get("sold_count")),
+        "scraped_at": now,
+        "updated_at": now,
         "discovery": "text_search",
         "search_keyword": keyword,
         "raw_search": product,

@@ -7,6 +7,7 @@ drive many search queries (link-crawler style coverage via API).
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Iterable
 
 # Appended to category leaf names for broader recall (English DS catalog).
@@ -291,9 +292,7 @@ SKIP_L1_CATEGORY_IDS: frozenset[str] = frozenset(
 )
 
 
-def load_keywords_file(path: str) -> list[str]:
-    from pathlib import Path
-
+def load_keywords_file(path: str | Path) -> list[str]:
     text = Path(path).read_text(encoding="utf-8")
     out: list[str] = []
     seen: set[str] = set()

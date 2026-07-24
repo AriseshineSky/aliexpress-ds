@@ -232,9 +232,17 @@ def upsert_url_docs(
     urls_index: str,
     docs: list[dict[str, Any]],
 ) -> int:
-    """Bulk upsert URL seed docs via update+doc_as_upsert. Doc id = {source}_{product_id}."""
+    """Bulk upsert URL seed docs. Doc id = {source}_{product_id}.
+
+    ``updated_at`` / ``scraped_at`` / listing fields are merged on every write.
+    ``created_at`` and ``bestseller_first_seen_at`` are set on insert (and filled
+    only if missing on update) so daily re-sync does not rewrite create time.
+    """
     if not docs:
         return 0
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
     actions: list[dict[str, Any]] = []
     for doc in docs:
         pid = str(doc.get("product_id") or "").strip()
@@ -245,8 +253,54 @@ def upsert_url_docs(
         body = dict(doc)
         body.pop("raw_feed", None)
         body.pop("raw_search", None)
+        body["updated_at"] = body.get("updated_at") or now
+        if not body.get("scraped_at"):
+            body["scraped_at"] = now
+
+        created_at = body.pop("created_at", None) or now
+        first_seen = body.pop("bestseller_first_seen_at", None)
+        tags = body.get("tags") or []
+        is_bs = bool(
+            body.get("is_bestseller")
+            or body.get("bestseller")
+            or ("bestseller" in tags if isinstance(tags, list) else tags == "bestseller")
+        )
+        if first_seen is None and is_bs:
+            first_seen = body.get("bestseller_synced_at") or now
+
+        upsert = dict(body)
+        upsert["created_at"] = created_at
+        if first_seen is not None:
+            upsert["bestseller_first_seen_at"] = first_seen
+
+        # Update path: merge fields, keep create-only timestamps if already set.
+        script_params = {
+            "doc": body,
+            "created_at": created_at,
+            "first_seen": first_seen,
+            "set_first_seen": first_seen is not None,
+        }
         actions.append({"update": {"_index": urls_index, "_id": doc_id}})
-        actions.append({"doc": body, "doc_as_upsert": True})
+        actions.append(
+            {
+                "script": {
+                    "source": """
+                        for (entry in params.doc.entrySet()) {
+                          ctx._source[entry.getKey()] = entry.getValue();
+                        }
+                        if (ctx._source.created_at == null) {
+                          ctx._source.created_at = params.created_at;
+                        }
+                        if (params.set_first_seen && ctx._source.bestseller_first_seen_at == null) {
+                          ctx._source.bestseller_first_seen_at = params.first_seen;
+                        }
+                    """,
+                    "lang": "painless",
+                    "params": script_params,
+                },
+                "upsert": upsert,
+            }
+        )
     if not actions:
         return 0
     resp = es.bulk(operations=actions, refresh=False)

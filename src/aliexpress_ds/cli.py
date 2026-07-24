@@ -934,6 +934,443 @@ def discover_feed_loop(
     )
 
 
+@app.command("discover-itemids")
+def discover_itemids(
+    feed_name: Optional[list[str]] = typer.Option(
+        None,
+        "--feed-name",
+        "-f",
+        help="Feed/promo name (repeatable). Default: all from feedname.get",
+    ),
+    category_id: Optional[list[str]] = typer.Option(
+        None,
+        "--category-id",
+        "-C",
+        help="Optional L1 category_id filter (repeatable)",
+    ),
+    max_pages: int = typer.Option(
+        5000,
+        "--pages",
+        "-p",
+        help="Max pages per (feed, category); stops early on empty/no-new",
+    ),
+    page_size: int = typer.Option(50, "--page-size", help="1-50"),
+    min_interval: float = typer.Option(1.0, "--min-interval"),
+    flush_every: int = typer.Option(500, "--flush-every"),
+    write_es: bool = typer.Option(True, "--write-es/--no-write-es"),
+    output: Path = typer.Option(
+        Path("data/discovered_itemids.jsonl"),
+        "--output",
+        "-o",
+    ),
+) -> None:
+    """Mass-fetch product_ids via aliexpress.ds.feed.itemids.get (IDs only).
+
+    Unlike recommend.feed / text.search, this API returns **no** price, rating,
+    or sold_count — only product_id lists. Paginate with returned ``search_id``.
+    Use when you need maximum ID coverage; enrich later with product.get / crawl.
+    """
+    from aliexpress_ds.feed import (
+        FeedService,
+        extract_itemids,
+        itemid_to_url_doc,
+        parse_feed_promos,
+    )
+    from aliexpress_ds.rate_limit import RateLimiter
+
+    settings = get_settings()
+    try:
+        settings.require_credentials()
+        if write_es:
+            settings.require_es()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    limiter = RateLimiter(
+        min_interval_sec=max(0.2, float(min_interval)),
+        daily_limit=settings.aliexpress_daily_limit,
+        state_path=Path("data/rate_limit_itemids.json"),
+    )
+    client = IopClient(limiter=limiter)
+    feedsvc = FeedService(client=client)
+
+    feeds = [f.strip() for f in (feed_name or []) if f and str(f).strip()]
+    if not feeds:
+        console.print("Loading feed names …")
+        try:
+            promos = parse_feed_promos(feedsvc.list_feed_names())
+        except (ValueError, IopError, DailyQuotaExhausted, RuntimeError) as exc:
+            err_console.print(f"[red]feedname.get failed:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        feeds = [str(p["name"]) for p in promos if p.get("name")]
+        console.print(f"feeds from API: {len(feeds)}")
+
+    cats: list[str | None]
+    if category_id:
+        cats = [c.strip() for c in category_id if c and str(c).strip()]
+    else:
+        cats = [None]
+
+    jobs: list[tuple[str, str | None]] = []
+    for fname in feeds:
+        for cid in cats:
+            jobs.append((fname, cid))
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    es = make_es_client(settings) if write_es else None
+    seen: set[str] = set()
+    if output.exists():
+        with output.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pid = str(row.get("product_id") or "").strip()
+                if pid:
+                    seen.add(pid)
+
+    pending: list[dict] = []
+    total_new = 0
+    total_indexed = 0
+    api_calls = 0
+    flush_n = max(1, int(flush_every))
+
+    def flush() -> None:
+        nonlocal pending, total_indexed
+        if not pending or es is None:
+            pending = []
+            return
+        total_indexed += upsert_url_docs(es, settings.es_urls_index, pending)
+        pending = []
+
+    console.print(
+        f"itemids jobs={len(jobs)} pages≤{max_pages} page_size={page_size} "
+        f"already_seen={len(seen)} write_es={write_es}"
+    )
+
+    with output.open("a", encoding="utf-8") as fh:
+        for ji, (fname, cid) in enumerate(jobs, start=1):
+            search_id: str | None = None
+            page_new = 0
+            console.print(
+                f"[bold][{ji}/{len(jobs)}][/bold] feed={fname!r} category={cid or '-'}"
+            )
+            for page in range(1, max(1, int(max_pages)) + 1):
+                try:
+                    payload = feedsvc.itemids(
+                        feed_name=fname,
+                        category_id=cid,
+                        page_size=page_size,
+                        search_id=search_id,
+                        page_no=page,
+                    )
+                    api_calls += 1
+                except DailyQuotaExhausted as exc:
+                    flush()
+                    err_console.print(f"[yellow]{exc}[/yellow]")
+                    raise typer.Exit(code=2) from exc
+                except (ValueError, IopError, RuntimeError) as exc:
+                    err_console.print(f"[red]{fname} p{page}:[/red] {exc}")
+                    break
+
+                ids, meta = extract_itemids(payload)
+                search_id = str(meta.get("search_id") or "") or search_id
+                kept = 0
+                for pid in ids:
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    doc = itemid_to_url_doc(
+                        pid, feed_name=fname, category_id=cid
+                    )
+                    if not doc:
+                        continue
+                    kept += 1
+                    total_new += 1
+                    page_new += 1
+                    pending.append(doc)
+                    fh.write(json.dumps(doc, ensure_ascii=False) + "\n")
+                    if len(pending) >= flush_n:
+                        flush()
+
+                console.print(
+                    f"  p{page}: got={len(ids)} new={kept} "
+                    f"total≈{meta.get('total')} unique={total_new}"
+                )
+                if not ids:
+                    break
+                if kept == 0 and page > 2:
+                    console.print("  [dim]no new ids — next job[/dim]")
+                    break
+
+            flush()
+            console.print(f"  job done new={page_new}")
+
+    flush()
+    console.print(
+        f"[green]Done[/green] unique_new={total_new} es_indexed={total_indexed} "
+        f"api_calls={api_calls} seen_total={len(seen)} → {output}"
+    )
+
+
+@app.command("discover-itemids-loop")
+def discover_itemids_loop(
+    target_unique: int = typer.Option(
+        20_000_000,
+        "--target-unique",
+        help="Stop after this many unique product_ids written this run+resume",
+    ),
+    feed_name: Optional[list[str]] = typer.Option(
+        None,
+        "--feed-name",
+        "-f",
+        help="Limit to these feeds (default: all from feedname.get)",
+    ),
+    category_id: Optional[list[str]] = typer.Option(
+        None,
+        "--category-id",
+        "-C",
+        help="Also split by L1 category_id (Droplo-style pools)",
+    ),
+    priority_categories: bool = typer.Option(
+        True,
+        "--priority-categories/--no-priority-categories",
+        help="When no -C: also run priority L1 category_ids × Droplo feeds",
+    ),
+    max_pages_per_job: int = typer.Option(
+        5000,
+        "--max-pages-per-job",
+        help="Soft page ceiling per (feed, category)",
+    ),
+    page_size: int = typer.Option(50, "--page-size"),
+    min_interval: float = typer.Option(1.0, "--min-interval"),
+    flush_every: int = typer.Option(500, "--flush-every"),
+    checkpoint: Path = typer.Option(
+        Path("data/discover_itemids_checkpoint.json"),
+        "--checkpoint",
+    ),
+    write_es: bool = typer.Option(True, "--write-es/--no-write-es"),
+    output: Path = typer.Option(
+        Path("data/discovered_itemids_mass.jsonl"),
+        "--output",
+        "-o",
+    ),
+) -> None:
+    """Continuous feed.itemids.get until --target-unique (IDs only, no metrics).
+
+    Best path for multi-million product_id harvest. Checkpoint/resume supported.
+    """
+    from aliexpress_ds.feed import (
+        PRIORITY_FEED_CATEGORY_IDS,
+        FeedService,
+        extract_itemids,
+        itemid_to_url_doc,
+        parse_feed_promos,
+    )
+    from aliexpress_ds.rate_limit import RateLimiter
+
+    settings = get_settings()
+    try:
+        settings.require_credentials()
+        if write_es:
+            settings.require_es()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    limiter = RateLimiter(
+        min_interval_sec=max(0.2, float(min_interval)),
+        daily_limit=settings.aliexpress_daily_limit,
+        state_path=Path("data/rate_limit_itemids.json"),
+    )
+    client = IopClient(limiter=limiter)
+    feedsvc = FeedService(client=client)
+
+    feeds = [f.strip() for f in (feed_name or []) if f and str(f).strip()]
+    if not feeds:
+        console.print("Loading feed names …")
+        promos = parse_feed_promos(feedsvc.list_feed_names())
+        feeds = [str(p["name"]) for p in promos if p.get("name")]
+
+    extra_cats: list[str] = []
+    if category_id:
+        extra_cats = [c.strip() for c in category_id if c and str(c).strip()]
+    elif priority_categories:
+        extra_cats = list(dict.fromkeys(PRIORITY_FEED_CATEGORY_IDS.values()))
+
+    jobs: list[tuple[str, str | None]] = []
+    for fname in feeds:
+        jobs.append((fname, None))
+        is_droplo = "droplo" in fname.lower() or fname.startswith("AEB_")
+        if is_droplo and extra_cats:
+            for cid in extra_cats:
+                jobs.append((fname, cid))
+    # de-dupe
+    seen_jobs: set[tuple[str, str | None]] = set()
+    uniq_jobs: list[tuple[str, str | None]] = []
+    for job in jobs:
+        if job in seen_jobs:
+            continue
+        seen_jobs.add(job)
+        uniq_jobs.append(job)
+    jobs = uniq_jobs
+
+    state: dict = {
+        "done_jobs": [],
+        "unique_count": 0,
+        "es_indexed": 0,
+        "api_calls": 0,
+        "job_index": 0,
+        "page": 1,
+        "search_id": None,
+    }
+    if checkpoint.exists():
+        try:
+            loaded = json.loads(checkpoint.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                state.update(loaded)
+        except (OSError, json.JSONDecodeError) as exc:
+            err_console.print(f"[yellow]checkpoint load failed:[/yellow] {exc}")
+
+    done_set = {
+        (str(x[0]), x[1] if len(x) > 1 else None)
+        for x in (state.get("done_jobs") or [])
+        if isinstance(x, (list, tuple)) and x
+    }
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    seen_pids: set[str] = set()
+    if output.exists():
+        with output.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pid = str(row.get("product_id") or "").strip()
+                if pid:
+                    seen_pids.add(pid)
+
+    kept_count = max(int(state.get("unique_count") or 0), len(seen_pids))
+    target = max(1, int(target_unique))
+    es = make_es_client(settings) if write_es else None
+    pending: list[dict] = []
+    total_indexed = int(state.get("es_indexed") or 0)
+    api_calls = int(state.get("api_calls") or 0)
+    flush_n = max(1, int(flush_every))
+    soft_pages = max(1, int(max_pages_per_job))
+
+    def save_ckpt(**extra: object) -> None:
+        state.update(extra)
+        state["unique_count"] = kept_count
+        state["es_indexed"] = total_indexed
+        state["api_calls"] = api_calls
+        state["done_jobs"] = [list(x) for x in sorted(done_set, key=lambda t: (t[0], t[1] or ""))]
+        state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def flush() -> None:
+        nonlocal pending, total_indexed
+        if not pending or es is None:
+            pending = []
+            return
+        total_indexed += upsert_url_docs(es, settings.es_urls_index, pending)
+        pending = []
+        save_ckpt()
+
+    console.print(
+        f"itemids-loop target={target} jobs={len(jobs)} page_size={page_size} "
+        f"already={kept_count} write_es={write_es}"
+    )
+    console.print(
+        "[dim]Note: feed.itemids.get has NO price/rating/sold — IDs only[/dim]"
+    )
+
+    start_ji = int(state.get("job_index") or 0)
+    resume_page = int(state.get("page") or 1)
+    resume_sid = state.get("search_id") or None
+
+    try:
+        with output.open("a", encoding="utf-8") as fh:
+            for ji in range(start_ji, len(jobs)):
+                if kept_count >= target:
+                    break
+                fname, cid = jobs[ji]
+                key = (fname, cid)
+                if key in done_set and ji != start_ji:
+                    continue
+                page = resume_page if ji == start_ji else 1
+                search_id = resume_sid if ji == start_ji else None
+                resume_page = 1
+                resume_sid = None
+                console.print(
+                    f"[bold][{ji + 1}/{len(jobs)}][/bold] feed={fname!r} cat={cid or '-'}"
+                )
+                while page <= soft_pages and kept_count < target:
+                    try:
+                        payload = feedsvc.itemids(
+                            feed_name=fname,
+                            category_id=cid,
+                            page_size=page_size,
+                            search_id=str(search_id) if search_id else None,
+                            page_no=page,
+                        )
+                        api_calls += 1
+                    except DailyQuotaExhausted as exc:
+                        flush()
+                        save_ckpt(job_index=ji, page=page, search_id=search_id)
+                        err_console.print(f"[yellow]{exc}[/yellow]")
+                        raise typer.Exit(code=2) from exc
+                    except (ValueError, IopError, RuntimeError) as exc:
+                        err_console.print(f"[red]{fname} p{page}:[/red] {exc}")
+                        break
+
+                    ids, meta = extract_itemids(payload)
+                    search_id = str(meta.get("search_id") or "") or search_id
+                    new_this = 0
+                    for pid in ids:
+                        if pid in seen_pids:
+                            continue
+                        seen_pids.add(pid)
+                        doc = itemid_to_url_doc(
+                            pid, feed_name=fname, category_id=cid
+                        )
+                        if not doc:
+                            continue
+                        new_this += 1
+                        kept_count += 1
+                        pending.append(doc)
+                        fh.write(json.dumps(doc, ensure_ascii=False) + "\n")
+                        if len(pending) >= flush_n:
+                            flush()
+
+                    console.print(
+                        f"  p{page}: got={len(ids)} new={new_this} "
+                        f"unique={kept_count}/{target} total≈{meta.get('total')}"
+                    )
+                    save_ckpt(job_index=ji, page=page + 1, search_id=search_id)
+                    if not ids:
+                        break
+                    if new_this == 0 and page > 2:
+                        break
+                    page += 1
+
+                done_set.add(key)
+                flush()
+                save_ckpt(job_index=ji + 1, page=1, search_id=None)
+    finally:
+        flush()
+        save_ckpt()
+
+    console.print(
+        f"[green]Done[/green] unique={kept_count} es_indexed={total_indexed} "
+        f"api_calls={api_calls} → {output}"
+    )
+
+
 @app.command("bestsellers-daily")
 def bestsellers_daily(
     pages_per_job: int = typer.Option(
@@ -977,6 +1414,7 @@ def bestsellers_daily(
     2) Upsert urls with is_bestseller / tags=bestseller / bestseller_synced_at
     3) Diff against ES_PRODUCTS_INDEX; missing ids → priority Redis queue (RPUSH)
     4) Write rating/reviews/sold_count distribution report under reports/
+    5) Snapshot product_ids + day-over-day entered/exited report
     """
     from aliexpress_ds.bestsellers import (
         build_bestseller_jobs,
@@ -986,6 +1424,7 @@ def bestsellers_daily(
         scroll_bestseller_urls,
         sync_bestsellers_from_feed,
         upsert_marked_batch,
+        write_changes_report,
         write_report,
     )
     from aliexpress_ds.queue import get_product_queue
@@ -1075,11 +1514,11 @@ def bestsellers_daily(
             if d.get("product_id")
         ]
         enqueued, skipped_q = q.enqueue_many(
-            items, force=force_enqueue, priority=True
+            items, force=False, priority=True, use_seen=False
         )
         console.print(
             f"[green]Priority enqueue[/green] new={enqueued} skipped={skipped_q} "
-            f"(force={force_enqueue})"
+            f"(dedupe=ES products, use_seen=False)"
         )
     elif dry_run and missing:
         console.print(f"[dim]dry-run: would priority-enqueue {len(missing)}[/dim]")
@@ -1092,12 +1531,97 @@ def bestsellers_daily(
         synced_stats=synced_stats,
     )
     json_path, md_path = write_report(report, reports_dir)
+    snap_path, chg_json, chg_md, diff = write_changes_report(bestsellers, reports_dir)
     console.print(f"Report → {md_path}")
     console.print(f"Report → {json_path}")
+    console.print(f"Ids snapshot → {snap_path}")
+    console.print(f"Changes → {chg_md}")
     console.print(
         f"[green]Done[/green] bestsellers={len(bestsellers)} "
-        f"missing={len(missing)} enqueued={enqueued}"
+        f"missing={len(missing)} enqueued={enqueued} "
+        f"entered={diff.get('entered_count')} exited={diff.get('exited_count')}"
     )
+
+
+@app.command("bestsellers-changes")
+def bestsellers_changes(
+    reports_dir: Path = typer.Option(
+        Path("reports"),
+        "--reports-dir",
+        help="Where to read/write bestsellers_ids_*/bestsellers_changes_*",
+    ),
+    day: Optional[str] = typer.Option(
+        None,
+        "--day",
+        help="UTC day YYYYMMDD (default: today). Compares to previous snapshot.",
+    ),
+    refresh_from_es: bool = typer.Option(
+        True,
+        "--refresh-from-es/--from-snapshot-only",
+        help="Re-scroll ES bestsellers and write today's ids snapshot before diff",
+    ),
+) -> None:
+    """Show day-over-day bestseller enter/exit using id snapshots under reports/.
+
+    Each run (or bestsellers-daily) writes ``bestsellers_ids_YYYYMMDD.json``.
+    This command diffs against the previous day file.
+    """
+    from aliexpress_ds.bestsellers import (
+        find_previous_ids_snapshot,
+        load_ids_snapshot,
+        scroll_bestseller_urls,
+        write_changes_report,
+    )
+
+    settings = get_settings()
+    try:
+        if refresh_from_es:
+            settings.require_es()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    day_s = (day or datetime.now(timezone.utc).strftime("%Y%m%d")).strip()
+    if len(day_s) != 8 or not day_s.isdigit():
+        err_console.print("[red]--day must be YYYYMMDD[/red]")
+        raise typer.Exit(code=1)
+
+    if refresh_from_es:
+        es = make_es_client(settings)
+        console.print("Loading bestseller urls from ES …")
+        bestsellers = scroll_bestseller_urls(es, settings.es_urls_index)
+        console.print(f"Bestsellers tagged in urls: {len(bestsellers)}")
+        snap_path, chg_json, chg_md, diff = write_changes_report(
+            bestsellers, reports_dir, day=day_s
+        )
+    else:
+        from aliexpress_ds.bestsellers import diff_id_snapshots, render_changes_markdown
+
+        snap_path = reports_dir / f"bestsellers_ids_{day_s}.json"
+        snap = load_ids_snapshot(snap_path)
+        if not snap:
+            err_console.print(f"[red]Missing snapshot[/red] {snap_path}")
+            raise typer.Exit(code=1)
+        prev_path = find_previous_ids_snapshot(reports_dir, day_s)
+        prev = load_ids_snapshot(prev_path) if prev_path else None
+        diff = diff_id_snapshots(snap, prev)
+        if prev_path:
+            diff["previous_snapshot"] = str(prev_path)
+        chg_json = reports_dir / f"bestsellers_changes_{day_s}.json"
+        chg_md = reports_dir / f"bestsellers_changes_{day_s}.md"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        chg_json.write_text(json.dumps(diff, ensure_ascii=False, indent=2), encoding="utf-8")
+        chg_md.write_text(render_changes_markdown(diff), encoding="utf-8")
+
+    console.print(
+        f"day={diff.get('day')} vs {diff.get('prev_day') or 'none'}  "
+        f"current={diff.get('current_count')} prev={diff.get('previous_count')}  "
+        f"entered={diff.get('entered_count')} exited={diff.get('exited_count')} "
+        f"retained={diff.get('retained_count')} net={diff.get('net_change')}"
+    )
+    console.print(f"Snapshot → {snap_path}")
+    console.print(f"Changes → {chg_md}")
+    console.print(f"Changes → {chg_json}")
 
 
 @app.command("discover-search")
@@ -1494,6 +2018,11 @@ def discover_search_loop(
     ),
     max_keywords: int = typer.Option(200, "--max-keywords"),
     max_leaves: int = typer.Option(150, "--max-leaves"),
+    keywords_file: Optional[Path] = typer.Option(
+        None,
+        "--keywords-file",
+        help="Use this keyword list (one per line) instead of auto category keywords",
+    ),
     flush_every: int = typer.Option(
         100,
         "--flush-every",
@@ -1525,12 +2054,15 @@ def discover_search_loop(
 
     Paginates each keyword until empty / no-new pages (soft max-pages ceiling).
     Checkpoint/resume; ES update+doc_as_upsert; local rating filter.
+
+    text.search **does** return price / rating (score) / sold (orders) — saved to ES.
     """
     from aliexpress_ds.categories import CategoryService, flatten_category_tree
     from aliexpress_ds.keywords import (
         PRIORITY_L1_CATEGORY_IDS,
         SKIP_L1_CATEGORY_IDS,
         keywords_from_category_rows,
+        load_keywords_file,
     )
     from aliexpress_ds.rate_limit import RateLimiter
     from aliexpress_ds.search import (
@@ -1572,18 +2104,31 @@ def discover_search_loop(
         hot_area=hot_area,
     )
 
-    console.print("Loading DS category tree …")
-    try:
-        tree_payload = cats.fetch_raw()
-    except (ValueError, IopError, DailyQuotaExhausted, RuntimeError) as exc:
-        err_console.print(f"[red]category.get failed:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-    rows = flatten_category_tree(tree_payload)
-    path_by_id = {
-        str(r.get("category_id")): str(r.get("path") or "")
-        for r in rows
-        if r.get("category_id")
-    }
+    file_keywords: list[str] | None = None
+    if keywords_file is not None:
+        file_keywords = load_keywords_file(keywords_file)
+        if not file_keywords:
+            err_console.print(f"[red]No keywords in {keywords_file}[/red]")
+            raise typer.Exit(code=1)
+        console.print(f"Using keywords-file: {len(file_keywords)} keywords")
+
+    path_by_id: dict[str, str] = {}
+    if file_keywords is None or categories_file is not None:
+        # Only needed when expanding keywords from the category tree.
+        console.print("Loading DS category tree …")
+        try:
+            tree_payload = cats.fetch_raw()
+        except (ValueError, IopError, DailyQuotaExhausted, RuntimeError) as exc:
+            err_console.print(f"[red]category.get failed:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        rows = flatten_category_tree(tree_payload)
+        path_by_id = {
+            str(r.get("category_id")): str(r.get("path") or "")
+            for r in rows
+            if r.get("category_id")
+        }
+    else:
+        console.print("Skipping category.get (keywords-file only)")
 
     if categories_file is not None:
         cat_ids = [
@@ -1591,6 +2136,9 @@ def discover_search_loop(
             for ln in categories_file.read_text(encoding="utf-8").splitlines()
             if ln.strip() and not ln.strip().startswith("#")
         ]
+    elif file_keywords is not None:
+        # Global keyword search (no category_id narrowing)
+        cat_ids = [""]
     else:
         cat_ids = [
             cid
@@ -1697,13 +2245,17 @@ def discover_search_loop(
             for ci in range(start_cat, len(cat_ids)):
                 if kept_count >= target:
                     break
-                cid = str(cat_ids[ci])
-                cpath = path_by_id.get(cid) or cid
-                keywords = keywords_from_category_rows(
-                    rows,
-                    parent_category_id=cid,
-                    max_leaves=max_leaves,
-                )[: max(1, int(max_keywords))]
+                cid_raw = str(cat_ids[ci])
+                cid = cid_raw or None
+                cpath = path_by_id.get(cid_raw) or (cid_raw or "(global)")
+                if file_keywords is not None:
+                    keywords = list(file_keywords)
+                else:
+                    keywords = keywords_from_category_rows(
+                        rows,
+                        parent_category_id=str(cid),
+                        max_leaves=max_leaves,
+                    )[: max(1, int(max_keywords))]
                 # de-dupe
                 seen_kw: set[str] = set()
                 uniq_kw: list[str] = []
@@ -1716,7 +2268,7 @@ def discover_search_loop(
                 keywords = uniq_kw
                 console.print(
                     f"[bold]Category[/bold] [{ci + 1}/{len(cat_ids)}] "
-                    f"id={cid} path={cpath} keywords={len(keywords)}"
+                    f"id={cid or '-'} path={cpath} keywords={len(keywords)}"
                 )
 
                 kw_start = resume_kw if ci == start_cat else 0
@@ -2257,12 +2809,20 @@ def enqueue_es(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Re-enqueue even if product_id is already in Redis seen set",
+        help="Legacy: write Redis seen set while enqueueing (default off for enqueue-es)",
+    ),
+    reset_queue: bool = typer.Option(
+        False,
+        "--reset-queue/--no-reset-queue",
+        help=(
+            "Clear Redis queue list (+ drop obsolete seen set) before rebuild. "
+            "Dedupe is always against ES_PRODUCTS_INDEX, not Redis seen."
+        ),
     ),
     skip_existing_products: bool = typer.Option(
         True,
         "--skip-existing/--include-existing",
-        help="Only enqueue ids missing from ES_PRODUCTS_INDEX (default)",
+        help="Only enqueue ids missing from ES_PRODUCTS_INDEX (default; required for --reset-queue)",
     ),
     quality_filter: bool | None = typer.Option(
         None,
@@ -2272,18 +2832,20 @@ def enqueue_es(
             "(default: ENQUEUE_QUALITY_FILTER from .env)"
         ),
     ),
-    include_missing_fields: bool | None = typer.Option(
+    include_rest: bool | None = typer.Option(
         None,
+        "--include-rest/--no-include-rest",
         "--include-missing-fields/--no-include-missing-fields",
         help=(
-            "After quality-pass batch, append urls missing rating/reviews/sold "
-            "(default: ENQUEUE_INCLUDE_MISSING_FIELDS)"
+            "After quality-pass batch, append remaining not-in-products URLs "
+            "sorted by reviews DESC (default: ENQUEUE_INCLUDE_MISSING_FIELDS)"
         ),
     ),
-    missing_limit: int = typer.Option(
+    rest_limit: int = typer.Option(
         0,
+        "--rest-limit",
         "--missing-limit",
-        help="Max missing-field ids to append (0 = all)",
+        help="Max phase-2 (rest) ids to append (0 = all)",
     ),
     max_price: float | None = typer.Option(
         None,
@@ -2308,7 +2870,7 @@ def enqueue_es(
     sort_by: str = typer.Option(
         "reviews,desc",
         "--sort-by",
-        help="Sort quality candidates before LPUSH: reviews,desc|rating,desc|none",
+        help="Sort each phase before LPUSH: reviews,desc|rating,desc|none",
     ),
     category_blacklist: bool | None = typer.Option(
         None,
@@ -2325,13 +2887,15 @@ def enqueue_es(
 
     Default eligibility:
       - in ``user1_aliexpress_us_product_urls``
-      - not yet in ``user1_aliexpress_us_products``
-      - passes quality gates (price/rating/reviews/sold) when enabled
+      - **not** yet in ``user1_aliexpress_us_products`` (sole dedupe source)
       - not in category blacklist (clothing / adult) when enabled
 
-    When quality filter is on and ``--include-missing-fields`` (default), urls
-    missing rating/reviews/sold_count are appended after the quality-pass batch
-    so workers finish higher-quality jobs first (LPUSH+BRPOP order).
+    Phase 1 (quality): price/rating/reviews/sold gates, sorted by reviews DESC.
+    Phase 2 (rest): remaining not-in-products URLs, sorted by reviews DESC
+    (missing reviews last). LPUSH+BRPOP → workers finish phase 1 first.
+
+    ``--reset-queue`` clears the Redis list (and obsolete seen key) then rebuilds.
+    Redis seen is **not** used for enqueue-es dedupe.
     """
     from aliexpress_ds.category_blacklist import filter_items_by_category_blacklist
     from aliexpress_ds.queue import get_product_queue
@@ -2345,13 +2909,20 @@ def enqueue_es(
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
 
+    if reset_queue and not skip_existing_products:
+        err_console.print(
+            "[red]--reset-queue requires --skip-existing[/red] "
+            "(dedupe against ES products index)"
+        )
+        raise typer.Exit(code=1)
+
     use_quality = (
         settings.enqueue_quality_filter if quality_filter is None else quality_filter
     )
-    use_missing_fields = (
+    use_rest = (
         settings.enqueue_include_missing_fields
-        if include_missing_fields is None
-        else include_missing_fields
+        if include_rest is None
+        else include_rest
     )
     use_category_blacklist = (
         settings.enqueue_category_blacklist
@@ -2380,12 +2951,12 @@ def enqueue_es(
         )
         return filtered
 
-    def _apply_sort(items: list[dict]) -> list[dict]:
+    def _apply_sort(items: list[dict], *, label: str) -> list[dict]:
         sort_key = (sort_by or "none").strip().lower()
         if sort_key in {"", "none", "-"} or not items:
             return items
         field, _, direction = sort_key.partition(",")
-        field = field.strip() or "rating"
+        field = field.strip() or "reviews"
         reverse = (direction.strip() or "desc").lower() != "asc"
 
         def _sort_val(item: dict) -> float:
@@ -2393,14 +2964,18 @@ def enqueue_es(
             try:
                 if raw is None or raw == "":
                     return float("-inf") if reverse else float("inf")
-                return float(raw)
+                val = float(raw)
+                # Guard against corrupt listing metrics (e.g. id stuffed into reviews).
+                if field == "reviews" and (val < 0 or val > 5_000_000):
+                    return float("-inf") if reverse else float("inf")
+                return val
             except (TypeError, ValueError):
                 return float("-inf") if reverse else float("inf")
 
         items.sort(key=_sort_val, reverse=reverse)
         top = items[0]
         console.print(
-            f"Sorted by {field} {'desc' if reverse else 'asc'} "
+            f"Sorted ({label}) by {field} {'desc' if reverse else 'asc'} "
             f"(top sample {field}={top.get(field, '-')} "
             f"rating={top.get('rating', '-')} reviews={top.get('reviews', '-')})"
         )
@@ -2422,13 +2997,13 @@ def enqueue_es(
     else:
         console.print("Quality filter OFF")
 
-    if use_quality and use_missing_fields:
+    if use_quality and use_rest:
         console.print(
-            "Missing-fields batch ON (append after quality: "
-            "no rating / reviews / sold_count)"
+            "Rest batch ON (append after quality: remaining not-in-products, "
+            "reviews DESC)"
         )
     elif use_quality:
-        console.print("Missing-fields batch OFF")
+        console.print("Rest batch OFF (quality-only)")
 
     if use_category_blacklist:
         console.print(
@@ -2437,6 +3012,17 @@ def enqueue_es(
         )
     else:
         console.print("Category blacklist OFF")
+
+    if reset_queue:
+        console.print(
+            "Reset queue ON (clear Redis list; dedupe via ES products index, not seen)"
+        )
+
+    if not skip_existing_products:
+        console.print(
+            "[yellow]Warning[/yellow]: --include-existing skips products-index "
+            "dedupe; may re-fetch already indexed ids"
+        )
 
     console.print(f"Scanning {settings.es_urls_index} for quality candidates …")
     if skip_existing_products:
@@ -2501,39 +3087,42 @@ def enqueue_es(
             )
 
     pending = _apply_blacklist(pending, "quality")
-    pending = _apply_sort(pending)
+    pending = _apply_sort(pending, label="quality")
     if limit and limit > 0:
         pending = pending[:limit]
     quality_count = len(pending)
     console.print(f"Quality candidates: {quality_count}")
 
-    missing_pending: list[dict] = []
-    if use_quality and use_missing_fields and skip_existing_products:
+    rest_pending: list[dict] = []
+    if use_quality and use_rest and skip_existing_products:
         console.print(
-            f"Scanning {settings.es_urls_index} for missing-field candidates …"
+            f"Scanning {settings.es_urls_index} for remaining (non-quality) candidates …"
         )
         quality_ids = {str(x["product_id"]) for x in pending}
-        missing_pending = list(
+        # No quality / missing-fields filter: all urls not yet in products,
+        # excluding phase-1 ids. Sorted by reviews DESC below.
+        rest_pending = list(
             iter_missing_urls(
                 es,
                 urls_index=settings.es_urls_index,
                 products_index=settings.es_products_index,
                 existing_ids=existing,
-                missing_fields_only=True,
-                max_price=q_max_price,
+                quality_filter=False,
+                missing_fields_only=False,
                 exclude_ids=quality_ids,
             )
         )
-        missing_pending = _apply_blacklist(missing_pending, "missing-fields")
-        if missing_limit and missing_limit > 0:
-            missing_pending = missing_pending[:missing_limit]
-        console.print(f"Missing-field candidates (queue back): {len(missing_pending)}")
+        rest_pending = _apply_blacklist(rest_pending, "rest")
+        rest_pending = _apply_sort(rest_pending, label="rest")
+        if rest_limit and rest_limit > 0:
+            rest_pending = rest_pending[:rest_limit]
+        console.print(f"Rest candidates (queue back): {len(rest_pending)}")
 
-    # Quality first, missing last → LPUSH order → BRPOP processes quality first.
-    pending = pending + missing_pending
+    # Quality first, rest last → LPUSH order → BRPOP processes quality first.
+    pending = pending + rest_pending
     console.print(
         f"Candidates to enqueue: {len(pending)} "
-        f"(quality={quality_count} missing_fields={len(missing_pending)})"
+        f"(quality={quality_count} rest={len(rest_pending)})"
     )
     if dry_run:
         console.print("[yellow]dry-run[/yellow] — not writing to Redis")
@@ -2548,11 +3137,25 @@ def enqueue_es(
         return
 
     q = get_product_queue(settings)
-    new, skipped = q.enqueue_many(pending, force=force)
+    if reset_queue:
+        # Drop pending jobs + obsolete seen key; do not use seen for dedupe.
+        cleared = q.clear(clear_seen=True)
+        console.print(
+            f"[yellow]Cleared queue[/yellow] "
+            f"queue_removed={cleared.get('queue_removed')} "
+            f"seen_removed={cleared.get('seen_removed')}"
+        )
+    # Dedupe is already applied via ES products index (skip_existing).
+    # Do not consult Redis seen — use_seen=False.
+    new, skipped = q.enqueue_many(
+        pending, force=bool(force), use_seen=bool(force)
+    )
     console.print(
         f"[green]Enqueued[/green] new={new} skipped={skipped} "
-        f"quality={quality_count} missing_fields={len(missing_pending)} "
-        f"queue_len={q.length()} seen={q.seen_count()} "
+        f"quality={quality_count} rest={len(rest_pending)} "
+        f"reset={reset_queue} use_seen={bool(force)} "
+        f"products_skip={skip_existing_products} "
+        f"queue_len={q.length()} "
         f"→ {settings.redis_queue_key}"
     )
 

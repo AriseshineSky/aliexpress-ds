@@ -84,6 +84,13 @@ def mark_bestseller_doc(
     out["bestseller"] = True
     out["bestseller_feed"] = feed_name
     out["bestseller_synced_at"] = synced_at
+    # First-seen only written on insert / if missing (upsert_url_docs preserves it).
+    out["bestseller_first_seen_at"] = out.get("bestseller_first_seen_at") or synced_at
+    out["updated_at"] = synced_at
+    if not out.get("created_at"):
+        out["created_at"] = synced_at
+    if not out.get("scraped_at"):
+        out["scraped_at"] = synced_at
     if category_id:
         out["bestseller_category_id"] = str(category_id)
     out["discovery"] = out.get("discovery") or "recommend_feed"
@@ -182,6 +189,10 @@ def scroll_bestseller_urls(
         "category",
         "bestseller_feed",
         "bestseller_synced_at",
+        "bestseller_first_seen_at",
+        "created_at",
+        "updated_at",
+        "scraped_at",
         "is_bestseller",
         "tags",
     ]
@@ -416,6 +427,165 @@ def write_report(report: dict[str, Any], reports_dir: Path) -> tuple[Path, Path]
         md_path.read_text(encoding="utf-8"), encoding="utf-8"
     )
     return json_path, md_path
+
+
+def _product_id_set(docs: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(d.get("product_id") or "").strip()
+        for d in docs
+        if str(d.get("product_id") or "").strip()
+    }
+
+
+def build_ids_snapshot(docs: list[dict[str, Any]], *, day: str | None = None) -> dict[str, Any]:
+    """Compact daily snapshot of bestseller product_ids for day-over-day diffs."""
+    day = day or datetime.now(timezone.utc).strftime("%Y%m%d")
+    ids = sorted(_product_id_set(docs))
+    by_feed: dict[str, list[str]] = {}
+    for d in docs:
+        pid = str(d.get("product_id") or "").strip()
+        if not pid:
+            continue
+        feed = str(d.get("bestseller_feed") or d.get("feed_name") or "unknown")
+        by_feed.setdefault(feed, []).append(pid)
+    for feed, pids in by_feed.items():
+        by_feed[feed] = sorted(set(pids))
+    return {
+        "day": day,
+        "generated_at": utc_now_iso(),
+        "count": len(ids),
+        "product_ids": ids,
+        "by_feed": {k: {"count": len(v), "product_ids": v} for k, v in sorted(by_feed.items())},
+    }
+
+
+def write_ids_snapshot(
+    docs: list[dict[str, Any]],
+    reports_dir: Path,
+    *,
+    day: str | None = None,
+) -> Path:
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    snap = build_ids_snapshot(docs, day=day)
+    day = str(snap["day"])
+    path = reports_dir / f"bestsellers_ids_{day}.json"
+    path.write_text(json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
+    (reports_dir / "bestsellers_ids_latest.json").write_text(
+        path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    return path
+
+
+def load_ids_snapshot(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def find_previous_ids_snapshot(reports_dir: Path, day: str) -> Path | None:
+    """Find newest bestsellers_ids_YYYYMMDD.json strictly before ``day``."""
+    if not reports_dir.exists():
+        return None
+    candidates: list[tuple[str, Path]] = []
+    for p in reports_dir.glob("bestsellers_ids_????????.json"):
+        stem = p.stem  # bestsellers_ids_YYYYMMDD
+        parts = stem.rsplit("_", 1)
+        if len(parts) != 2 or len(parts[1]) != 8 or not parts[1].isdigit():
+            continue
+        if parts[1] < day:
+            candidates.append((parts[1], p))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def diff_id_snapshots(
+    current: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> dict[str, Any]:
+    cur_ids = set(str(x) for x in (current.get("product_ids") or []) if str(x).strip())
+    prev_ids = set(str(x) for x in ((previous or {}).get("product_ids") or []) if str(x).strip())
+    entered = sorted(cur_ids - prev_ids)
+    exited = sorted(prev_ids - cur_ids)
+    retained = sorted(cur_ids & prev_ids)
+    return {
+        "day": current.get("day"),
+        "prev_day": (previous or {}).get("day"),
+        "generated_at": utc_now_iso(),
+        "current_count": len(cur_ids),
+        "previous_count": len(prev_ids),
+        "entered_count": len(entered),
+        "exited_count": len(exited),
+        "retained_count": len(retained),
+        "net_change": len(cur_ids) - len(prev_ids),
+        "entered_sample": entered[:50],
+        "exited_sample": exited[:50],
+        "entered": entered,
+        "exited": exited,
+    }
+
+
+def render_changes_markdown(diff: dict[str, Any]) -> str:
+    lines = [
+        "# Bestsellers day-over-day changes",
+        "",
+        f"- day: `{diff.get('day')}` vs prev `{diff.get('prev_day') or 'none'}`",
+        f"- generated_at: `{diff.get('generated_at')}`",
+        f"- current_count: **{diff.get('current_count')}**",
+        f"- previous_count: **{diff.get('previous_count')}**",
+        f"- entered: **{diff.get('entered_count')}**",
+        f"- exited: **{diff.get('exited_count')}**",
+        f"- retained: **{diff.get('retained_count')}**",
+        f"- net_change: **{diff.get('net_change')}**",
+        "",
+        "## Entered (sample ≤50)",
+        "```",
+        "\n".join(diff.get("entered_sample") or []) or "(none)",
+        "```",
+        "",
+        "## Exited (sample ≤50)",
+        "```",
+        "\n".join(diff.get("exited_sample") or []) or "(none)",
+        "```",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_changes_report(
+    docs: list[dict[str, Any]],
+    reports_dir: Path,
+    *,
+    day: str | None = None,
+) -> tuple[Path, Path, Path, dict[str, Any]]:
+    """Write ids snapshot + day-over-day changes (json/md). Returns paths + diff."""
+    day = day or datetime.now(timezone.utc).strftime("%Y%m%d")
+    snap_path = write_ids_snapshot(docs, reports_dir, day=day)
+    snap = load_ids_snapshot(snap_path) or {}
+    prev_path = find_previous_ids_snapshot(reports_dir, day)
+    prev = load_ids_snapshot(prev_path) if prev_path else None
+    diff = diff_id_snapshots(snap, prev)
+    if prev_path:
+        diff["previous_snapshot"] = str(prev_path)
+    json_path = reports_dir / f"bestsellers_changes_{day}.json"
+    md_path = reports_dir / f"bestsellers_changes_{day}.md"
+    # Drop full id lists from the markdown-facing json size? Keep full in json.
+    json_path.write_text(json.dumps(diff, ensure_ascii=False, indent=2), encoding="utf-8")
+    md_path.write_text(render_changes_markdown(diff), encoding="utf-8")
+    (reports_dir / "bestsellers_changes_latest.json").write_text(
+        json_path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (reports_dir / "bestsellers_changes_latest.md").write_text(
+        md_path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    return snap_path, json_path, md_path, diff
 
 
 def make_feed_service(client: IopClient | None = None) -> FeedService:

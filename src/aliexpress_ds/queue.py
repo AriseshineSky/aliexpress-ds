@@ -156,6 +156,7 @@ class ProductQueue:
         force: bool = False,
         batch_size: int = 1000,
         priority: bool = False,
+        use_seen: bool = True,
     ) -> tuple[int, int]:
         """Enqueue list of {product_id, url?, source?}. Returns (new, skipped).
 
@@ -163,6 +164,9 @@ class ProductQueue:
 
         priority=True uses RPUSH so BRPOP picks these jobs before older LPUSH
         backlog (worker uses BRPOP = pop from right).
+
+        use_seen=False skips the Redis seen-set entirely (caller must dedupe via
+        ES products index or similar). force is ignored when use_seen is False.
         """
         new = 0
         skipped = 0
@@ -175,11 +179,12 @@ class ProductQueue:
             if not chunk:
                 return
             pids = [pid for pid, _ in chunk]
-            if force:
-                pipe = self.client.pipeline(transaction=False)
-                for pid in pids:
-                    pipe.sadd(self.seen_key, pid)
-                pipe.execute()
+            if not use_seen or force:
+                if use_seen and force:
+                    pipe = self.client.pipeline(transaction=False)
+                    for pid in pids:
+                        pipe.sadd(self.seen_key, pid)
+                    pipe.execute()
                 pipe = self.client.pipeline(transaction=False)
                 for _pid, payload in chunk:
                     getattr(pipe, push_cmd)(self.queue_key, payload)
@@ -187,7 +192,7 @@ class ProductQueue:
                 new += len(chunk)
                 return
 
-            # Non-force: only enqueue ids newly added to seen
+            # Non-force + use_seen: only enqueue ids newly added to seen
             pipe = self.client.pipeline(transaction=False)
             for pid in pids:
                 pipe.sadd(self.seen_key, pid)
@@ -202,7 +207,6 @@ class ProductQueue:
                     skipped += 1
             if pushed:
                 pipe.execute()
-                new += pushed
             else:
                 # avoid executing empty pipeline
                 pass
