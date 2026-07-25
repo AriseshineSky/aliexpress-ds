@@ -11,10 +11,11 @@ _PKG_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_BLACKLIST_FILE = _PKG_ROOT / "config" / "category_blacklist.yaml"
 
 # Fallback when YAML is missing.
+# Bare "apparel" is intentionally omitted: it false-positives "Apparel Accessories".
 _DEFAULT_KEYWORDS: tuple[str, ...] = (
     "women's clothing",
     "men's clothing",
-    "apparel",
+    "apparel & accessories",
     "clothing",
     "clothes",
     "dress",

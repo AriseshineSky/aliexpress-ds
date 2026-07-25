@@ -1,12 +1,15 @@
 # Category blacklist for enqueue-es (urls index ``category`` field).
 # Matched with word/phrase boundaries (case-insensitive).
+# Goal: block 成衣 (garments), not 服饰配件 — e.g. allow "Apparel Accessories".
 # Override: ENQUEUE_CATEGORY_BLACKLIST_KEYWORDS=foo,bar in .env
 
 keywords:
-  # --- clothing / 服装 ---
+  # --- clothing / 成衣 ---
+  # Do NOT use bare "apparel": it false-positives "Apparel Accessories"
+  # (配件, not garments). Keep "apparel & accessories" for the clothing tree.
   - women's clothing
   - men's clothing
-  - apparel
+  - apparel & accessories
   - clothing
   - clothes
   - dress
