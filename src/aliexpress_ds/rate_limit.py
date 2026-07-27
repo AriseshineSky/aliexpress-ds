@@ -10,7 +10,9 @@ Use AliExpress Open Service docs/console (not Taobao TOP 流量包 FAQ):
 Limit kinds we handle from API **error** bodies (success responses have no quota fields):
 
 1. Per AppKey daily quota (Beijing GMT+8) — match Console package; local
-   ``ALIEXPRESS_DAILY_LIMIT`` is client-side only.
+   ``ALIEXPRESS_DAILY_LIMIT`` / Redis ``apps.daily_limit`` are client-side only.
+   Missing Redis daily_limit → unlimited local + 2s pacing; with daily_limit →
+   pace at ``86400/daily_limit`` unless ``min_interval_sec`` is set.
    Sub-code: ``accesscontrol.limited-by-app-access-count``
 
 2. Per-API QPS / minute caps. Often includes
@@ -44,8 +46,8 @@ BEIJING = timezone(timedelta(hours=8))
 
 # Conservative defaults: Online apps rarely publish a fixed QPS for DS APIs.
 # Proactive pacing stays under typical soft caps; response-driven backoff handles the rest.
-DEFAULT_MIN_INTERVAL_SEC = 5.0  # ~0.2 QPS; long AppApiCallLimit bans at 1–3s pacing
-DEFAULT_DAILY_LIMIT = 5000  # Formal Test Environment
+DEFAULT_MIN_INTERVAL_SEC = 2.0  # when Redis has no daily_limit for the AppKey
+DEFAULT_DAILY_LIMIT = 0  # 0 = no local daily stop; prefer Redis apps.daily_limit
 MAX_ADAPTIVE_INTERVAL_SEC = 15.0
 MIN_ADAPTIVE_INTERVAL_SEC = 0.2
 # After multi-hour App+API bans, never resume faster than this until process restart
@@ -225,21 +227,26 @@ class RateLimiter:
                 data = json.loads(self.state_path.read_text(encoding="utf-8"))
                 if data.get("day") == self._day:
                     self._count = int(data.get("count") or 0)
-                # Persist pacing floor raised after hard bans (survive systemd restart).
-                saved_base = float(data.get("base_interval_sec") or 0)
-                if saved_base > self.base_interval_sec:
-                    self.base_interval_sec = min(MAX_ADAPTIVE_INTERVAL_SEC, saved_base)
-                    self.min_interval_sec = self.base_interval_sec
-                    self._effective_interval = self.base_interval_sec
                 # Resume wall-clock cooldown if still active from prior process.
+                # Only keep an elevated pacing floor while that cooldown is active;
+                # otherwise Redis/env configured interval is authoritative again.
                 cool_until = data.get("cooldown_until_epoch")
                 if cool_until is not None:
                     remaining = float(cool_until) - time.time()
                     if remaining > 1.0:
                         self._cooldown_until = time.monotonic() + remaining
+                        saved_base = float(data.get("base_interval_sec") or 0)
+                        if saved_base > self.base_interval_sec:
+                            self.base_interval_sec = min(
+                                MAX_ADAPTIVE_INTERVAL_SEC, saved_base
+                            )
+                            self.min_interval_sec = self.base_interval_sec
+                            self._effective_interval = self.base_interval_sec
                         logger.warning(
-                            "Resumed platform cooldown %.0fs from state file",
+                            "Resumed platform cooldown %.0fs from state file "
+                            "(base_interval=%.2fs)",
                             remaining,
+                            self.base_interval_sec,
                         )
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass

@@ -328,7 +328,7 @@ def config_check() -> None:
     except ValueError as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
-    from aliexpress_ds.app_registry import REDIS_APPS_KEY, load_app_from_redis
+    from aliexpress_ds.app_registry import REDIS_APPS_KEY, load_app_from_redis, resolve_pace
 
     app_meta = load_app_from_redis(settings.aliexpress_app_key, settings=settings)
     console.print("[green]Credentials OK[/green]")
@@ -338,6 +338,17 @@ def config_check() -> None:
     console.print(
         f"app_secret_source={'redis:' + REDIS_APPS_KEY if app_meta else 'env'}"
     )
+    console.print(
+        f"daily_limit={settings.aliexpress_daily_limit or '∞'} "
+        f"min_interval_sec={settings.aliexpress_min_interval_sec:.4f} "
+        f"(from Redis apps when set)"
+    )
+    if app_meta is not None:
+        _, _, note = resolve_pace(
+            daily_limit=app_meta.get("daily_limit"),
+            min_interval_sec=app_meta.get("min_interval_sec"),
+        )
+        console.print(f"pace_source={note}")
     console.print(f"api_url={settings.aliexpress_api_url}")
     console.print(f"oauth_redis={'yes' if settings.redis_url else 'no'}")
     if settings.redis_url:
@@ -352,6 +363,99 @@ def config_check() -> None:
         console.print(f"expires_at={data.get('expires_at')}")
         console.print(f"refresh_expires_at={data.get('refresh_expires_at')}")
         console.print(f"access_expired_soon={access_token_expired(data)}")
+
+
+@app.command("app-limits-show")
+def app_limits_show(
+    app_key: Optional[str] = typer.Option(
+        None,
+        "--app-key",
+        "-k",
+        help="AppKey (default: ALIEXPRESS_APP_KEY from .env)",
+    ),
+) -> None:
+    """Show Redis registry rate limits for an AppKey."""
+    from aliexpress_ds.app_registry import (
+        REDIS_APPS_KEY,
+        load_app_from_redis,
+        resolve_pace,
+    )
+
+    settings = get_settings()
+    key = (app_key or settings.aliexpress_app_key or "").strip()
+    if not key:
+        err_console.print("[red]app_key required[/red]")
+        raise typer.Exit(code=1)
+    if not (settings.redis_url or "").strip():
+        err_console.print("[red]REDIS_URL missing[/red]")
+        raise typer.Exit(code=1)
+    entry = load_app_from_redis(key, settings=settings)
+    if not entry:
+        err_console.print(f"[red]AppKey {key} not in Redis {REDIS_APPS_KEY}[/red]")
+        raise typer.Exit(code=1)
+    daily, interval, note = resolve_pace(
+        daily_limit=entry.get("daily_limit"),
+        min_interval_sec=entry.get("min_interval_sec"),
+    )
+    console.print(f"redis_key={REDIS_APPS_KEY}")
+    console.print(f"app_key={key}")
+    if entry.get("label"):
+        console.print(f"label={entry['label']}")
+    console.print(f"redis_daily_limit={entry.get('daily_limit', '(unset)')}")
+    console.print(f"redis_min_interval_sec={entry.get('min_interval_sec', '(unset)')}")
+    console.print(f"effective_daily_limit={daily or '∞'}")
+    console.print(f"effective_min_interval_sec={interval:.4f}")
+    console.print(f"pace_source={note}")
+
+
+@app.command("app-limits-set")
+def app_limits_set(
+    daily_limit: int = typer.Option(
+        ...,
+        "--daily-limit",
+        "-d",
+        help="Console API Call Limit / day (0 clears Redis daily_limit → unlimited+2s)",
+    ),
+    app_key: Optional[str] = typer.Option(
+        None,
+        "--app-key",
+        "-k",
+        help="AppKey (default: ALIEXPRESS_APP_KEY from .env)",
+    ),
+    min_interval_sec: Optional[float] = typer.Option(
+        None,
+        "--min-interval-sec",
+        help="Optional explicit interval; omit to use 86400/daily_limit",
+    ),
+    clear_min_interval: bool = typer.Option(
+        False,
+        "--clear-min-interval",
+        help="Remove explicit min_interval_sec so pace is calculated from daily_limit",
+    ),
+) -> None:
+    """Write daily_limit (and optional min_interval) into Redis aliexpress:oauth:apps."""
+    from aliexpress_ds.app_registry import update_app_limits, resolve_pace
+
+    settings = get_settings()
+    key = (app_key or settings.aliexpress_app_key or "").strip()
+    try:
+        entry = update_app_limits(
+            key,
+            daily_limit=daily_limit,
+            min_interval_sec=min_interval_sec,
+            clear_min_interval=clear_min_interval,
+            settings=settings,
+        )
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    daily, interval, note = resolve_pace(
+        daily_limit=entry.get("daily_limit"),
+        min_interval_sec=entry.get("min_interval_sec"),
+    )
+    console.print(f"[green]Updated[/green] app_key={key}")
+    console.print(f"effective_daily_limit={daily or '∞'}")
+    console.print(f"effective_min_interval_sec={interval:.4f} ({note})")
 
 
 @app.command("refresh-token")
@@ -2753,17 +2857,23 @@ def rate_status() -> None:
 
     Successful AE responses do not include remaining daily quota. The only
     platform-reported limits we see are error bodies (e.g. AppApiCallLimit ban
-    seconds). ALIEXPRESS_DAILY_LIMIT is a local client-side cap only.
+    seconds). Redis apps.daily_limit (else env) is a local client-side cap only.
     """
     from pathlib import Path
 
-    settings = get_settings()
+    from aliexpress_ds.app_registry import ensure_app_credentials
+
+    settings = ensure_app_credentials(get_settings())
     state_path = Path("data/rate_limit_state.json")
     platform_path = Path("data/platform_rate_limit.json")
 
-    console.print("[bold]Local client cap[/bold] (ALIEXPRESS_DAILY_LIMIT — not from API)")
+    console.print(
+        "[bold]Local client cap[/bold] "
+        "(Redis apps.daily_limit preferred — not from API success)"
+    )
+    console.print(f"  app_key={settings.aliexpress_app_key}")
     console.print(f"  daily_limit={settings.aliexpress_daily_limit or '∞ (disabled)'}")
-    console.print(f"  min_interval_sec={settings.aliexpress_min_interval_sec}")
+    console.print(f"  min_interval_sec={settings.aliexpress_min_interval_sec:.4f}")
     console.print(f"  queue_concurrency={settings.queue_concurrency}")
     if state_path.exists():
         try:

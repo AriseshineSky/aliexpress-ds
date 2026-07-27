@@ -39,11 +39,13 @@ class Settings(BaseSettings):
     es_categories_index: str = "user1_aliexpress_ds_categories"
     es_crawl_categories_index: str = "user1_aliexpress_crawl_categories"
 
-    # LOCAL client-side daily cap only (Beijing GMT+8). Not returned by API on success.
-    # Match Console 管理证书, or 0 = no local daily stop (platform errors still apply).
-    # QPS / AppApiCallLimit ban seconds come only from error responses.
-    aliexpress_daily_limit: int = 100000
-    aliexpress_min_interval_sec: float = 5.0  # ~0.2 QPS; hard bans persist a higher floor
+    # LOCAL client-side pacing (Beijing GMT+8). Prefer Redis aliexpress:oauth:apps
+    # fields daily_limit / min_interval_sec via ensure_app_credentials().
+    # Missing Redis daily_limit → 0 (unlimited local) + 2s interval.
+    # With daily_limit → interval = 86400/daily_limit unless min_interval_sec set.
+    # Platform QPS / AppApiCallLimit ban seconds still come only from error responses.
+    aliexpress_daily_limit: int = 0
+    aliexpress_min_interval_sec: float = 2.0
     aliexpress_max_retries: int = 6  # flow-control / transport retries per call
 
     # Quality gates for enqueue-es (from ES urls index listing fields).

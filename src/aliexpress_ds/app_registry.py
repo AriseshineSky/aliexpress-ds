@@ -2,7 +2,14 @@
 
 Hash key: ``aliexpress:oauth:apps``
 Field: app_key
-Value: JSON ``{"app_secret": "...", "label": "..."}``
+Value: JSON::
+
+    {
+      "app_secret": "...",
+      "label": "...",
+      "daily_limit": 70000,          # optional; omit/0 = no local daily cap
+      "min_interval_sec": 1.23       # optional; if omitted and daily_limit>0 → 86400/daily_limit
+    }
 """
 
 from __future__ import annotations
@@ -21,12 +28,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 REDIS_APPS_KEY = "aliexpress:oauth:apps"
-# Re-read Redis periodically so console secret updates apply without restart.
+# Re-read Redis periodically so console secret / limit updates apply without restart.
 _MEMORY_MAX_AGE = 300.0
 
+SECONDS_PER_DAY = 86400.0
+# When Redis has no daily_limit for this AppKey: local daily cap off, pace at 2s.
+DEFAULT_INTERVAL_NO_DAILY_LIMIT = 2.0
+
 _cache_lock = threading.Lock()
-# cache_key → (monotonic_ts, app_secret, label)
-_secret_cache: dict[str, tuple[float, str, str | None]] = {}
+# cache_key → (monotonic_ts, entry_dict)
+_entry_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def _cache_key(settings: Settings) -> str:
@@ -35,12 +46,59 @@ def _cache_key(settings: Settings) -> str:
     return f"{url}|{app}"
 
 
+def _parse_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_pace(
+    *,
+    daily_limit: int | None,
+    min_interval_sec: float | None,
+) -> tuple[int, float, str]:
+    """Return ``(daily_limit, min_interval_sec, source_note)``.
+
+    - ``daily_limit`` None/≤0 → local unlimited (0), interval defaults to 2s
+      (or explicit ``min_interval_sec`` if set).
+    - ``daily_limit`` >0 → interval = 86400/daily_limit unless ``min_interval_sec``
+      is explicitly set (>0).
+    """
+    lim = int(daily_limit or 0)
+    if lim <= 0:
+        if min_interval_sec is not None and min_interval_sec > 0:
+            return 0, float(min_interval_sec), "no_daily_limit+explicit_interval"
+        return 0, DEFAULT_INTERVAL_NO_DAILY_LIMIT, "no_daily_limit→2.0s"
+
+    if min_interval_sec is not None and min_interval_sec > 0:
+        return lim, float(min_interval_sec), "daily_limit+explicit_interval"
+
+    calculated = SECONDS_PER_DAY / float(lim)
+    return lim, calculated, f"daily_limit→{SECONDS_PER_DAY:g}/{lim}"
+
+
 def load_app_from_redis(
     app_key: str,
     *,
     settings: Settings | None = None,
 ) -> dict[str, Any] | None:
-    """Return ``{app_key, app_secret, label}`` from Redis hash, or None."""
+    """Return app registry entry from Redis hash, or None.
+
+    Keys: ``app_key``, ``app_secret``, ``label``, optional ``daily_limit``,
+    ``min_interval_sec``.
+    """
     from aliexpress_ds.config import get_settings
 
     settings = settings or get_settings()
@@ -68,13 +126,110 @@ def load_app_from_redis(
     if not secret:
         return None
     label = str(data.get("label") or "").strip() or None
-    return {"app_key": key, "app_secret": secret, "label": label}
+    out: dict[str, Any] = {"app_key": key, "app_secret": secret, "label": label}
+    daily = _parse_optional_int(data.get("daily_limit"))
+    if daily is not None:
+        out["daily_limit"] = daily
+    interval = _parse_optional_float(data.get("min_interval_sec"))
+    if interval is not None:
+        out["min_interval_sec"] = interval
+    return out
+
+
+def update_app_limits(
+    app_key: str,
+    *,
+    daily_limit: int | None = None,
+    min_interval_sec: float | None = None,
+    clear_min_interval: bool = False,
+    app_secret: str | None = None,
+    label: str | None = None,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Merge rate-limit fields into Redis app registry (create if secret available).
+
+    Pass ``daily_limit=0`` to clear the local daily cap in Redis.
+    Pass ``clear_min_interval=True`` to remove explicit interval (use calculated).
+    If the AppKey is missing, ``app_secret`` (or ``settings.aliexpress_app_secret`` /
+    env) is required to create the hash field.
+    """
+    from aliexpress_ds.config import get_settings
+
+    settings = settings or get_settings()
+    url = (settings.redis_url or "").strip()
+    key = (app_key or "").strip()
+    if not url:
+        raise ValueError("REDIS_URL missing")
+    if not key or key.startswith("your_"):
+        raise ValueError("app_key required")
+
+    from aliexpress_ds.token_store import _redis_client
+
+    client = _redis_client(url)
+    raw = client.hget(REDIS_APPS_KEY, key)
+    data: dict[str, Any]
+    if raw:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON for AppKey {key}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"Invalid registry value for AppKey {key}")
+        data = parsed
+    else:
+        secret = (app_secret or settings.aliexpress_app_secret or "").strip()
+        if not secret or secret.startswith("your_"):
+            raise ValueError(
+                f"AppKey {key} not in Redis {REDIS_APPS_KEY}; "
+                "pass --app-secret or set ALIEXPRESS_APP_SECRET to create it"
+            )
+        data = {"app_secret": secret}
+        if label:
+            data["label"] = label
+
+    if app_secret and not str(app_secret).startswith("your_"):
+        data["app_secret"] = str(app_secret).strip()
+    if label:
+        data["label"] = label
+
+    if daily_limit is not None:
+        if daily_limit <= 0:
+            data.pop("daily_limit", None)
+        else:
+            data["daily_limit"] = int(daily_limit)
+    if clear_min_interval:
+        data.pop("min_interval_sec", None)
+    elif min_interval_sec is not None:
+        if min_interval_sec <= 0:
+            data.pop("min_interval_sec", None)
+        else:
+            data["min_interval_sec"] = float(min_interval_sec)
+
+    if not str(data.get("app_secret") or data.get("secret") or "").strip():
+        raise ValueError(f"AppKey {key} registry entry missing app_secret")
+
+    client.hset(REDIS_APPS_KEY, key, json.dumps(data, ensure_ascii=False))
+    clear_app_credential_cache()
+    loaded = load_app_from_redis(key, settings=settings)
+    if loaded:
+        return loaded
+    return {
+        "app_key": key,
+        **{
+            k: data[k]
+            for k in ("app_secret", "label", "daily_limit", "min_interval_sec")
+            if k in data
+        },
+    }
 
 
 def ensure_app_credentials(settings: Settings | None = None) -> Settings:
-    """Fill ``aliexpress_app_secret`` from Redis when present (preferred over .env).
+    """Fill secret + rate limits from Redis when present.
 
     ``ALIEXPRESS_APP_KEY`` in .env selects which Redis hash field to use.
+    Rate limits: Redis ``daily_limit`` preferred; missing → local unlimited + 2s.
     Token remains in ``aliexpress:oauth:token:{app_key}`` (see token_store).
     """
     from aliexpress_ds.config import get_settings
@@ -87,33 +242,56 @@ def ensure_app_credentials(settings: Settings | None = None) -> Settings:
 
     ck = _cache_key(settings)
     now = time.monotonic()
+    entry: dict[str, Any] | None = None
     with _cache_lock:
-        hit = _secret_cache.get(ck)
+        hit = _entry_cache.get(ck)
         if hit is not None:
-            cached_at, secret, _label = hit
-            if now - cached_at <= _MEMORY_MAX_AGE and secret:
-                settings.aliexpress_app_secret = secret
-                return settings
+            cached_at, cached_entry = hit
+            if now - cached_at <= _MEMORY_MAX_AGE and cached_entry.get("app_secret"):
+                entry = cached_entry
 
-    entry = load_app_from_redis(app_key, settings=settings)
-    if entry and entry.get("app_secret"):
-        secret = str(entry["app_secret"])
-        label = entry.get("label")
-        settings.aliexpress_app_secret = secret
-        with _cache_lock:
-            _secret_cache[ck] = (now, secret, label if isinstance(label, str) else None)
-        logger.debug(
-            "Loaded app_secret from Redis %s[%s] label=%s",
-            REDIS_APPS_KEY,
-            app_key,
-            label,
-        )
+    if entry is None:
+        entry = load_app_from_redis(app_key, settings=settings)
+        if entry and entry.get("app_secret"):
+            with _cache_lock:
+                _entry_cache[ck] = (now, entry)
+            logger.debug(
+                "Loaded app from Redis %s[%s] label=%s daily_limit=%s",
+                REDIS_APPS_KEY,
+                app_key,
+                entry.get("label"),
+                entry.get("daily_limit"),
+            )
+
+    if not entry or not entry.get("app_secret"):
+        # Keep .env secret as fallback for apps not yet in the Redis registry.
         return settings
 
-    # Keep .env secret as fallback for apps not yet in the Redis registry.
+    settings.aliexpress_app_secret = str(entry["app_secret"])
+    apply_redis_rate_limits(settings, entry)
+    return settings
+
+
+def apply_redis_rate_limits(settings: Settings, entry: dict[str, Any]) -> Settings:
+    """Overwrite settings daily/interval from a Redis app entry."""
+    daily_raw = entry.get("daily_limit")
+    interval_raw = entry.get("min_interval_sec")
+    daily, interval, note = resolve_pace(
+        daily_limit=_parse_optional_int(daily_raw),
+        min_interval_sec=_parse_optional_float(interval_raw),
+    )
+    settings.aliexpress_daily_limit = daily
+    settings.aliexpress_min_interval_sec = interval
+    logger.info(
+        "AppKey %s rate limits from Redis: daily_limit=%s interval=%.4fs (%s)",
+        entry.get("app_key") or settings.aliexpress_app_key,
+        daily or "∞",
+        interval,
+        note,
+    )
     return settings
 
 
 def clear_app_credential_cache() -> None:
     with _cache_lock:
-        _secret_cache.clear()
+        _entry_cache.clear()

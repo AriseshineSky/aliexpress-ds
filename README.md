@@ -235,20 +235,25 @@ uv run aliexpress-ds bestsellers-daily
 
 | 限制 | 表现 | 处理 |
 |------|------|------|
-| **日配额**（Console 流量包） | `limited-by-app-access-count` / 日调用耗尽至北京时间 24:00 | 等到次日；本地 `ALIEXPRESS_DAILY_LIMIT` 仅作客户端保护，应对齐 Console |
-| **App+API 频率** | `AppApiCallLimit`：*frequency of app access to the api* + `ban will last N seconds` | **睡 N+1 秒**；与是否用满 10万/天无关 |
+| **日配额**（Console 流量包） | `limited-by-app-access-count` / 日调用耗尽至北京时间 24:00 | 等到次日；Redis `apps.daily_limit`（或 env）作本地保护 |
+| **App+API 频率** | `AppApiCallLimit`：*frequency of app access to the api* + `ban will last N seconds` | **睡 N+1 秒**；与是否用满日配额无关 |
 | **API 总频率** | `ApiCallLimits` / `ban will last N seconds` | 同上 |
 
 历史 AE 英文说明（三类 access count，域名在 alitrip，内容属 AliExpress Open Platform）：  
 [API access count limitation](https://open.alitrip.com/docs/doc.htm?articleId=108426&docType=1)
 
-本项目默认：
+**权威限额在 Redis** `aliexpress:oauth:apps`（按 AppKey）：
 
-| 变量 | 默认 | 说明 |
+```bash
+uv run aliexpress-ds app-limits-set -k 539674 -d 70000
+uv run aliexpress-ds app-limits-show -k 539674
+```
+
+| 来源 | 日帽 | 间隔 |
 |------|------|------|
-| `ALIEXPRESS_DAILY_LIMIT` | `100000` | **本地**日帽，对齐 Console（如 10万）；`0`=不本地掐断 |
-| `ALIEXPRESS_MIN_INTERVAL_SEC` | `1.0` | 主动 pacing，降低 `AppApiCallLimit` |
-| `ALIEXPRESS_MAX_RETRIES` | `6` | 按 ban 秒数退避；传输错误指数退避 |
+| Redis `daily_limit=N` | N | `86400/N`（或显式 `min_interval_sec`） |
+| Redis 无 `daily_limit` | 无限 | **2.0s**（平台 ban 仍生效） |
+| env 回退（无 Redis 注册） | `ALIEXPRESS_DAILY_LIMIT` 默认 0 | `ALIEXPRESS_MIN_INTERVAL_SEC` 默认 2.0 |
 
 查看：`uv run aliexpress-ds rate-status`（本地计数 + 最近一次平台错误原文）。
 
