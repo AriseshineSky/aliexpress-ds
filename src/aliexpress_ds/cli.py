@@ -414,7 +414,7 @@ def app_limits_set(
         ...,
         "--daily-limit",
         "-d",
-        help="Console API Call Limit / day (0 clears Redis daily_limit → unlimited+2s)",
+        help="Console API Call Limit / day (0 clears Redis daily_limit → unlimited+1s)",
     ),
     app_key: Optional[str] = typer.Option(
         None,
@@ -817,7 +817,7 @@ def discover_feed_loop(
     sort: str = typer.Option("volumeDesc", "--sort"),
     country: str = typer.Option("US", "--country", "-c"),
     min_interval: float = typer.Option(
-        2.0,
+        1.0,
         "--min-interval",
         help="Seconds between API calls",
     ),
@@ -2111,7 +2111,7 @@ def discover_search_loop(
     local: str = typer.Option("en_US", "--local"),
     currency: str = typer.Option("USD", "--currency"),
     min_interval: float = typer.Option(
-        2.0,
+        1.0,
         "--min-interval",
         help="Seconds between API calls (plus response-driven ban sleep)",
     ),

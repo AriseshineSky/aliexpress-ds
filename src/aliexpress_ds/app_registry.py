@@ -8,7 +8,7 @@ Value: JSON::
       "app_secret": "...",
       "label": "...",
       "daily_limit": 70000,          # optional; omit/0 = no local daily cap
-      "min_interval_sec": 1.23       # optional; if omitted and daily_limit>0 → 86400/daily_limit
+      "min_interval_sec": 1.0        # optional; if omitted and daily_limit>0 → min(86400/daily_limit, 1s)
     }
 """
 
@@ -32,8 +32,10 @@ REDIS_APPS_KEY = "aliexpress:oauth:apps"
 _MEMORY_MAX_AGE = 300.0
 
 SECONDS_PER_DAY = 86400.0
-# When Redis has no daily_limit for this AppKey: local daily cap off, pace at 2s.
-DEFAULT_INTERVAL_NO_DAILY_LIMIT = 2.0
+# When Redis has no daily_limit for this AppKey: local daily cap off, pace at 1s.
+DEFAULT_INTERVAL_NO_DAILY_LIMIT = 1.0
+# Never pace slower than 1 request/sec (interval > 1s → clamp to 1s).
+MAX_PACE_INTERVAL_SEC = 1.0
 
 _cache_lock = threading.Lock()
 # cache_key → (monotonic_ts, entry_dict)
@@ -64,6 +66,16 @@ def _parse_optional_float(value: Any) -> float | None:
         return None
 
 
+def _clamp_pace_interval(interval: float, note: str) -> tuple[float, str]:
+    """Ensure pacing is never slower than 1 request/sec."""
+    if interval > MAX_PACE_INTERVAL_SEC:
+        return (
+            MAX_PACE_INTERVAL_SEC,
+            f"{note}; capped→{MAX_PACE_INTERVAL_SEC:g}s (min 1req/s)",
+        )
+    return interval, note
+
+
 def resolve_pace(
     *,
     daily_limit: int | None,
@@ -71,22 +83,32 @@ def resolve_pace(
 ) -> tuple[int, float, str]:
     """Return ``(daily_limit, min_interval_sec, source_note)``.
 
-    - ``daily_limit`` None/≤0 → local unlimited (0), interval defaults to 2s
+    - ``daily_limit`` None/≤0 → local unlimited (0), interval defaults to 1s
       (or explicit ``min_interval_sec`` if set).
     - ``daily_limit`` >0 → interval = 86400/daily_limit unless ``min_interval_sec``
       is explicitly set (>0).
+    - Any resolved interval slower than 1 req/s is capped at 1.0s.
     """
     lim = int(daily_limit or 0)
     if lim <= 0:
         if min_interval_sec is not None and min_interval_sec > 0:
-            return 0, float(min_interval_sec), "no_daily_limit+explicit_interval"
-        return 0, DEFAULT_INTERVAL_NO_DAILY_LIMIT, "no_daily_limit→2.0s"
+            interval, note = _clamp_pace_interval(
+                float(min_interval_sec), "no_daily_limit+explicit_interval"
+            )
+            return 0, interval, note
+        return 0, DEFAULT_INTERVAL_NO_DAILY_LIMIT, "no_daily_limit→1.0s"
 
     if min_interval_sec is not None and min_interval_sec > 0:
-        return lim, float(min_interval_sec), "daily_limit+explicit_interval"
+        interval, note = _clamp_pace_interval(
+            float(min_interval_sec), "daily_limit+explicit_interval"
+        )
+        return lim, interval, note
 
     calculated = SECONDS_PER_DAY / float(lim)
-    return lim, calculated, f"daily_limit→{SECONDS_PER_DAY:g}/{lim}"
+    interval, note = _clamp_pace_interval(
+        calculated, f"daily_limit→{SECONDS_PER_DAY:g}/{lim}"
+    )
+    return lim, interval, note
 
 
 def load_app_from_redis(
@@ -229,7 +251,7 @@ def ensure_app_credentials(settings: Settings | None = None) -> Settings:
     """Fill secret + rate limits from Redis when present.
 
     ``ALIEXPRESS_APP_KEY`` in .env selects which Redis hash field to use.
-    Rate limits: Redis ``daily_limit`` preferred; missing → local unlimited + 2s.
+    Rate limits: Redis ``daily_limit`` preferred; missing → local unlimited + 1s.
     Token remains in ``aliexpress:oauth:token:{app_key}`` (see token_store).
     """
     from aliexpress_ds.config import get_settings

@@ -251,9 +251,9 @@ uv run aliexpress-ds app-limits-show -k 539674
 
 | 来源 | 日帽 | 间隔 |
 |------|------|------|
-| Redis `daily_limit=N` | N | `86400/N`（或显式 `min_interval_sec`） |
-| Redis 无 `daily_limit` | 无限 | **2.0s**（平台 ban 仍生效） |
-| env 回退（无 Redis 注册） | `ALIEXPRESS_DAILY_LIMIT` 默认 0 | `ALIEXPRESS_MIN_INTERVAL_SEC` 默认 2.0 |
+| Redis `daily_limit=N` | N | `min(86400/N, 1s)`（或显式 `min_interval_sec`；慢于 1 次/秒会封顶为 1s） |
+| Redis 无 `daily_limit` | 无限 | **1.0s**（平台 ban 仍生效） |
+| env 回退（无 Redis 注册） | `ALIEXPRESS_DAILY_LIMIT` 默认 0 | `ALIEXPRESS_MIN_INTERVAL_SEC` 默认 1.0 |
 
 查看：`uv run aliexpress-ds rate-status`（本地计数 + 最近一次平台错误原文）。
 

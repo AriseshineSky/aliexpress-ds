@@ -11,8 +11,9 @@ Limit kinds we handle from API **error** bodies (success responses have no quota
 
 1. Per AppKey daily quota (Beijing GMT+8) — match Console package; local
    ``ALIEXPRESS_DAILY_LIMIT`` / Redis ``apps.daily_limit`` are client-side only.
-   Missing Redis daily_limit → unlimited local + 2s pacing; with daily_limit →
-   pace at ``86400/daily_limit`` unless ``min_interval_sec`` is set.
+   Missing Redis daily_limit → unlimited local + 1s pacing; with daily_limit →
+   pace at ``min(86400/daily_limit, 1s)`` unless ``min_interval_sec`` is set
+   (intervals slower than 1 req/s are capped at 1.0s).
    Sub-code: ``accesscontrol.limited-by-app-access-count``
 
 2. Per-API QPS / minute caps. Often includes
@@ -46,7 +47,7 @@ BEIJING = timezone(timedelta(hours=8))
 
 # Conservative defaults: Online apps rarely publish a fixed QPS for DS APIs.
 # Proactive pacing stays under typical soft caps; response-driven backoff handles the rest.
-DEFAULT_MIN_INTERVAL_SEC = 2.0  # when Redis has no daily_limit for the AppKey
+DEFAULT_MIN_INTERVAL_SEC = 1.0  # when Redis has no daily_limit for the AppKey
 DEFAULT_DAILY_LIMIT = 0  # 0 = no local daily stop; prefer Redis apps.daily_limit
 MAX_ADAPTIVE_INTERVAL_SEC = 15.0
 MIN_ADAPTIVE_INTERVAL_SEC = 0.2

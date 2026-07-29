@@ -41,11 +41,12 @@ class Settings(BaseSettings):
 
     # LOCAL client-side pacing (Beijing GMT+8). Prefer Redis aliexpress:oauth:apps
     # fields daily_limit / min_interval_sec via ensure_app_credentials().
-    # Missing Redis daily_limit → 0 (unlimited local) + 2s interval.
-    # With daily_limit → interval = 86400/daily_limit unless min_interval_sec set.
+    # Missing Redis daily_limit → 0 (unlimited local) + 1s interval.
+    # With daily_limit → interval = min(86400/daily_limit, 1s) unless min_interval_sec set.
+    # Intervals slower than 1 req/s are capped at 1.0s.
     # Platform QPS / AppApiCallLimit ban seconds still come only from error responses.
     aliexpress_daily_limit: int = 0
-    aliexpress_min_interval_sec: float = 2.0
+    aliexpress_min_interval_sec: float = 1.0
     aliexpress_max_retries: int = 6  # flow-control / transport retries per call
 
     # Quality gates for enqueue-es (from ES urls index listing fields).
