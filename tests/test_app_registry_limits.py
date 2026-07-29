@@ -42,20 +42,20 @@ def test_resolve_pace_keeps_fast_calculated_interval() -> None:
     assert "capped" not in note
 
 
-def test_resolve_pace_explicit_interval_capped_when_slower() -> None:
+def test_resolve_pace_daily_limit_ignores_slower_explicit_interval() -> None:
     daily, interval, note = resolve_pace(daily_limit=50000, min_interval_sec=1.5)
     assert daily == 50000
     assert interval == MAX_PACE_INTERVAL_SEC
-    assert "explicit" in note
+    assert "explicit_interval_ignored" in note
     assert "capped" in note
 
 
-def test_resolve_pace_explicit_interval_kept_when_faster() -> None:
+def test_resolve_pace_daily_limit_ignores_faster_explicit_interval() -> None:
     daily, interval, note = resolve_pace(daily_limit=50000, min_interval_sec=0.5)
     assert daily == 50000
-    assert interval == 0.5
-    assert "explicit" in note
-    assert "capped" not in note
+    assert interval == MAX_PACE_INTERVAL_SEC
+    assert "explicit_interval_ignored" in note
+    assert "capped" in note
 
 
 def test_resolve_pace_no_daily_with_explicit_interval_capped() -> None:

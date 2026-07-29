@@ -207,6 +207,7 @@ class ProductQueue:
                     skipped += 1
             if pushed:
                 pipe.execute()
+                new += pushed
             else:
                 # avoid executing empty pipeline
                 pass

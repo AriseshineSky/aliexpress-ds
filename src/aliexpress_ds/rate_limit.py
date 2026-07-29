@@ -9,11 +9,10 @@ Use AliExpress Open Service docs/console (not Taobao TOP 流量包 FAQ):
 
 Limit kinds we handle from API **error** bodies (success responses have no quota fields):
 
-1. Per AppKey daily quota (Beijing GMT+8) — match Console package; local
-   ``ALIEXPRESS_DAILY_LIMIT`` / Redis ``apps.daily_limit`` are client-side only.
-   Missing Redis daily_limit → unlimited local + 1s pacing; with daily_limit →
-   pace at ``min(86400/daily_limit, 1s)`` unless ``min_interval_sec`` is set
-   (intervals slower than 1 req/s are capped at 1.0s).
+1. Per AppKey daily quota (Beijing GMT+8) — match Console package. Local
+   ``ALIEXPRESS_DAILY_LIMIT`` / Redis ``apps.daily_limit`` only calculate pace;
+   they never stop requests. Missing daily_limit → 1s pacing; with daily_limit →
+   pace at ``min(86400/daily_limit, 1s)``.
    Sub-code: ``accesscontrol.limited-by-app-access-count``
 
 2. Per-API QPS / minute caps. Often includes
@@ -48,7 +47,7 @@ BEIJING = timezone(timedelta(hours=8))
 # Conservative defaults: Online apps rarely publish a fixed QPS for DS APIs.
 # Proactive pacing stays under typical soft caps; response-driven backoff handles the rest.
 DEFAULT_MIN_INTERVAL_SEC = 1.0  # when Redis has no daily_limit for the AppKey
-DEFAULT_DAILY_LIMIT = 0  # 0 = no local daily stop; prefer Redis apps.daily_limit
+DEFAULT_DAILY_LIMIT = 0  # pace calculation only; never a local stop
 MAX_ADAPTIVE_INTERVAL_SEC = 15.0
 MIN_ADAPTIVE_INTERVAL_SEC = 0.2
 # After multi-hour App+API bans, never resume faster than this until process restart
@@ -74,7 +73,7 @@ class FlowControl:
 
 
 class DailyQuotaExhausted(RuntimeError):
-    """Local or platform daily AppKey quota exhausted (Beijing day)."""
+    """Platform-reported daily AppKey quota exhausted (Beijing day)."""
 
 
 def seconds_until_beijing_midnight() -> float:
@@ -270,16 +269,19 @@ class RateLimiter:
 
     @property
     def remaining_today(self) -> int | None:
-        if self.daily_limit <= 0:
-            return None
-        return max(0, self.daily_limit - self._count)
+        """No local remainder: daily_limit is a pacing hint, not a hard cap."""
+        return None
+
+    @property
+    def calls_today(self) -> int:
+        return self._count
 
     @property
     def effective_interval(self) -> float:
         return self._effective_interval
 
     def _prepare_turn_unlocked(self) -> float:
-        """Under lock: roll day / check quota. Return seconds to sleep, or 0 to claim.
+        """Under lock: roll day and pace. Return seconds to sleep, or 0 to claim.
 
         Caller must claim with ``_claim_turn_unlocked`` when return value is 0.
         """
@@ -288,12 +290,6 @@ class RateLimiter:
             self._day = today
             self._count = 0
             self._effective_interval = self.base_interval_sec
-
-        if self.daily_limit > 0 and self._count >= self.daily_limit:
-            raise DailyQuotaExhausted(
-                f"Local daily API quota exhausted ({self.daily_limit}/day Beijing time). "
-                "Resume after 00:00 GMT+8, or raise ALIEXPRESS_DAILY_LIMIT to match Console."
-            )
 
         now = time.monotonic()
         cool_wait = self._cooldown_until - now

@@ -15,6 +15,7 @@ from aliexpress_ds.config import get_settings
 from aliexpress_ds.es import (
     EsProductBuffer,
     iter_missing_urls,
+    iter_urls_by_reviews_priority,
     load_existing_product_ids,
     make_es_client,
     scroll_sources,
@@ -138,7 +139,10 @@ def _load_pending_from_urls_file(path: Path) -> list[dict]:
             if not pid or pid in seen:
                 continue
             seen.add(pid)
-            url = str(obj.get("url") or "").strip() or f"https://www.aliexpress.us/item/{pid}.html"
+            url = (
+                str(obj.get("url") or "").strip()
+                or f"https://www.aliexpress.us/item/{pid}.html"
+            )
             rows.append(
                 {
                     "product_id": pid,
@@ -236,7 +240,9 @@ async def _awrite_product_row(
 
 
 @app.command("parse-id")
-def parse_id(url: str = typer.Argument(..., help="AliExpress product URL or numeric id")) -> None:
+def parse_id(
+    url: str = typer.Argument(..., help="AliExpress product URL or numeric id"),
+) -> None:
     """Only extract product_id from a URL."""
     console.print(extract_product_id(url))
 
@@ -244,11 +250,17 @@ def parse_id(url: str = typer.Argument(..., help="AliExpress product URL or nume
 @app.command("get")
 def get_product(
     url: str = typer.Argument(..., help="Product URL or product_id"),
-    country: str = typer.Option("US", "--country", "-c", help="ship_to_country / local_country"),
+    country: str = typer.Option(
+        "US", "--country", "-c", help="ship_to_country / local_country"
+    ),
     currency: str = typer.Option("USD", "--currency", help="target_currency"),
     language: str = typer.Option("EN", "--language", "-l", help="target_language"),
-    raw: bool = typer.Option(True, "--raw/--no-raw", help="Include full API JSON in output"),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write JSON file"),
+    raw: bool = typer.Option(
+        True, "--raw/--no-raw", help="Include full API JSON in output"
+    ),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Write JSON file"
+    ),
 ) -> None:
     """Fetch product detail; emit StandardProduct (+ raw API payload)."""
     from aliexpress_ds.standard_mapper import to_standard_product
@@ -264,7 +276,9 @@ def get_product(
         )
         product = to_standard_product(
             summary.raw,
-            url=url if "://" in url else f"https://www.aliexpress.us/item/{summary.product_id}.html",
+            url=url
+            if "://" in url
+            else f"https://www.aliexpress.us/item/{summary.product_id}.html",
         )
     except (ValueError, IopError) as exc:
         err_console.print(f"[red]Error:[/red] {exc}")
@@ -281,10 +295,14 @@ def get_product(
         payload["raw"] = summary.raw
 
     if output:
-        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        output.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         console.print(f"Wrote {output}")
 
-    console.print(f"[bold]{product.get('product_id')}[/bold]  {product.get('title') or ''}")
+    console.print(
+        f"[bold]{product.get('product_id')}[/bold]  {product.get('title') or ''}"
+    )
     console.print(
         f"price={product.get('price')} {product.get('currency')}  "
         f"qty={product.get('available_qty')}  "
@@ -298,7 +316,11 @@ def get_product(
     table.add_column("offer_sale_price")
     table.add_column("available_stock")
     for sku in summary.skus:
-        stock = sku.sku_available_stock if sku.sku_available_stock is not None else sku.ipm_sku_stock
+        stock = (
+            sku.sku_available_stock
+            if sku.sku_available_stock is not None
+            else sku.ipm_sku_stock
+        )
         if stock is None:
             stock = sku.sku_stock
         table.add_row(
@@ -328,7 +350,11 @@ def config_check() -> None:
     except ValueError as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
-    from aliexpress_ds.app_registry import REDIS_APPS_KEY, load_app_from_redis, resolve_pace
+    from aliexpress_ds.app_registry import (
+        REDIS_APPS_KEY,
+        load_app_from_redis,
+        resolve_pace,
+    )
 
     app_meta = load_app_from_redis(settings.aliexpress_app_key, settings=settings)
     console.print("[green]Credentials OK[/green]")
@@ -864,8 +890,10 @@ def discover_feed_loop(
 
     feeds = [f.strip() for f in (feed_name or []) if f and f.strip()]
     if not feeds:
-        feeds = list(DEFAULT_BESTSELLER_FEEDS) if bestsellers_only else list(
-            DEFAULT_BESTSELLER_FEEDS
+        feeds = (
+            list(DEFAULT_BESTSELLER_FEEDS)
+            if bestsellers_only
+            else list(DEFAULT_BESTSELLER_FEEDS)
         )
 
     cats: list[str | None]
@@ -909,7 +937,10 @@ def discover_feed_loop(
             state.update(json.loads(checkpoint.read_text(encoding="utf-8")))
         except Exception:
             pass
-    done_set = {tuple(x) if isinstance(x, list) else tuple(x) for x in state.get("done_jobs") or []}
+    done_set = {
+        tuple(x) if isinstance(x, list) else tuple(x)
+        for x in state.get("done_jobs") or []
+    }
     # normalize done entries to (feed, cat|None)
     normalized_done: set[tuple[str, str | None]] = set()
     for item in done_set:
@@ -918,7 +949,9 @@ def discover_feed_loop(
         if len(item) == 1:
             normalized_done.add((str(item[0]), None))
         else:
-            normalized_done.add((str(item[0]), item[1] if item[1] is not None else None))
+            normalized_done.add(
+                (str(item[0]), item[1] if item[1] is not None else None)
+            )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     limiter = RateLimiter(
@@ -944,9 +977,13 @@ def discover_feed_loop(
     def save_ckpt() -> None:
         state["unique"] = total_new
         state["api_calls"] = int(state.get("api_calls") or 0)
-        state["done_jobs"] = [list(x) for x in sorted(normalized_done, key=lambda t: (t[0], t[1] or ""))]
+        state["done_jobs"] = [
+            list(x) for x in sorted(normalized_done, key=lambda t: (t[0], t[1] or ""))
+        ]
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        checkpoint.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     console.print(
         f"discover-feed-loop jobs={len(jobs)} feeds={len(feeds)} "
@@ -1186,9 +1223,7 @@ def discover_itemids(
                     if pid in seen:
                         continue
                     seen.add(pid)
-                    doc = itemid_to_url_doc(
-                        pid, feed_name=fname, category_id=cid
-                    )
+                    doc = itemid_to_url_doc(pid, feed_name=fname, category_id=cid)
                     if not doc:
                         continue
                     kept += 1
@@ -1371,10 +1406,16 @@ def discover_itemids_loop(
         state["unique_count"] = kept_count
         state["es_indexed"] = total_indexed
         state["api_calls"] = api_calls
-        state["done_jobs"] = [list(x) for x in sorted(done_set, key=lambda t: (t[0], t[1] or ""))]
-        state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        state["done_jobs"] = [
+            list(x) for x in sorted(done_set, key=lambda t: (t[0], t[1] or ""))
+        ]
+        state["updated_at"] = (
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        checkpoint.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     def flush() -> None:
         nonlocal pending, total_indexed
@@ -1439,9 +1480,7 @@ def discover_itemids_loop(
                         if pid in seen_pids:
                             continue
                         seen_pids.add(pid)
-                        doc = itemid_to_url_doc(
-                            pid, feed_name=fname, category_id=cid
-                        )
+                        doc = itemid_to_url_doc(pid, feed_name=fname, category_id=cid)
                         if not doc:
                             continue
                         new_this += 1
@@ -1714,7 +1753,9 @@ def bestsellers_changes(
         chg_json = reports_dir / f"bestsellers_changes_{day_s}.json"
         chg_md = reports_dir / f"bestsellers_changes_{day_s}.md"
         reports_dir.mkdir(parents=True, exist_ok=True)
-        chg_json.write_text(json.dumps(diff, ensure_ascii=False, indent=2), encoding="utf-8")
+        chg_json.write_text(
+            json.dumps(diff, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         chg_md.write_text(render_changes_markdown(diff), encoding="utf-8")
 
     console.print(
@@ -1929,7 +1970,9 @@ def discover_search(
             if needle in str(r.get("path") or "").lower()
             or needle in str(r.get("category_name") or "").lower()
         ]
-        matches.sort(key=lambda r: (int(r.get("level") or 99), str(r.get("path") or "")))
+        matches.sort(
+            key=lambda r: (int(r.get("level") or 99), str(r.get("path") or ""))
+        )
         if not matches:
             err_console.print(f"[red]No category matches[/red] name={category_name!r}")
             raise typer.Exit(code=1)
@@ -2245,9 +2288,7 @@ def discover_search_loop(
         cat_ids = [""]
     else:
         cat_ids = [
-            cid
-            for cid in PRIORITY_L1_CATEGORY_IDS
-            if cid not in SKIP_L1_CATEGORY_IDS
+            cid for cid in PRIORITY_L1_CATEGORY_IDS if cid not in SKIP_L1_CATEGORY_IDS
         ]
 
     # Resume state
@@ -2276,7 +2317,9 @@ def discover_search_loop(
                     f"page={state.get('page')}"
                 )
         except (OSError, json.JSONDecodeError) as exc:
-            err_console.print(f"[yellow]checkpoint load failed, starting fresh:[/yellow] {exc}")
+            err_console.print(
+                f"[yellow]checkpoint load failed, starting fresh:[/yellow] {exc}"
+            )
 
     seen_pids: set[str] = set(str(x) for x in (state.get("seen_pids") or []) if x)
     kept_count = int(state.get("unique_count") or 0)
@@ -2311,11 +2354,15 @@ def discover_search_loop(
         state["es_indexed"] = total_indexed
         state["dropped_low_rating"] = dropped
         state["api_calls"] = api_calls
-        state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        state["updated_at"] = (
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
         # Keep last 5k ids for resume hints without huge files
         state["seen_pids"] = list(seen_pids)[-5000:]
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        checkpoint.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     def _flush() -> None:
         nonlocal pending, total_indexed
@@ -2415,7 +2462,9 @@ def discover_search_loop(
                             err_console.print(f"[yellow]{exc}[/yellow]")
                             raise typer.Exit(code=2) from exc
                         except (ValueError, IopError, RuntimeError) as exc:
-                            err_console.print(f"[red]kw={kw!r} page={page}:[/red] {exc}")
+                            err_console.print(
+                                f"[red]kw={kw!r} page={page}:[/red] {exc}"
+                            )
                             if isinstance(exc, IopError) and exc.body is not None:
                                 err_console.print_json(data=exc.body)
                             _flush()
@@ -2545,7 +2594,9 @@ def fetch_es(
         "-o",
         help="Append JSONL results here",
     ),
-    limit: int = typer.Option(0, "--limit", "-n", help="Max products to fetch (0 = all)"),
+    limit: int = typer.Option(
+        0, "--limit", "-n", help="Max products to fetch (0 = all)"
+    ),
     country: str = typer.Option("US", "--country", "-c"),
     currency: str = typer.Option("USD", "--currency"),
     language: str = typer.Option("EN", "--language", "-l"),
@@ -2557,7 +2608,7 @@ def fetch_es(
     daily_limit: int = typer.Option(
         -1,
         "--daily-limit",
-        help="Max API calls/day (Beijing). <0 uses ALIEXPRESS_DAILY_LIMIT (5000 for Test apps)",
+        help="Pacing basis (calls/day); never a local stop. <0 uses configured value",
     ),
     dry_run: bool = typer.Option(
         False,
@@ -2624,8 +2675,8 @@ def fetch_es(
         already_today = _count_rows_today(output)
         limiter.ensure_min_count(already_today)
         console.print(
-            f"Rate limit: ≥{interval:.2f}s/call, daily≤{quota or '∞'} "
-            f"(Beijing day; used≈{already_today} remaining≈{limiter.remaining_today})"
+            f"Rate limit: ≥{interval:.2f}s/call, daily pace basis={quota or 'default'} "
+            f"(no local stop; Beijing-day calls≈{already_today})"
         )
 
     console.print("Connecting ES and loading existing product_ids …")
@@ -2681,7 +2732,9 @@ def fetch_es(
     quality_kept = 0
 
     quality_fh = (
-        quality_output.open("a", encoding="utf-8") if quality_filter and not dry_run else None
+        quality_output.open("a", encoding="utf-8")
+        if quality_filter and not dry_run
+        else None
     )
     try:
         with output.open("a", encoding="utf-8") as fh:
@@ -2705,7 +2758,9 @@ def fetch_es(
                     fh.write(json.dumps(row, ensure_ascii=False) + "\n")
                     fetched += 1
                 else:
-                    assert service is not None and limiter is not None and iop is not None
+                    assert (
+                        service is not None and limiter is not None and iop is not None
+                    )
                     try:
                         summary = service.get_by_url(
                             item["url"],
@@ -2734,9 +2789,7 @@ def fetch_es(
                             and isinstance(product, dict)
                             and product_meets_quality(product)
                         ):
-                            quality_fh.write(
-                                json.dumps(row, ensure_ascii=False) + "\n"
-                            )
+                            quality_fh.write(json.dumps(row, ensure_ascii=False) + "\n")
                             quality_fh.flush()
                             quality_kept += 1
                         if es_buf is not None and isinstance(product, dict):
@@ -2748,7 +2801,7 @@ def fetch_es(
                                 f"pending_es={es_buf.pending if es_buf else 0} "
                                 f"quality={quality_kept} "
                                 f"interval≈{limiter.effective_interval:.2f}s "
-                                f"remaining_today≈{limiter.remaining_today}"
+                                f"calls_today≈{limiter.calls_today}"
                             )
                     except DailyQuotaExhausted as exc:
                         err_console.print(f"[yellow]{exc}[/yellow]")
@@ -2915,7 +2968,9 @@ def rate_status() -> None:
 
 @app.command("enqueue-es")
 def enqueue_es(
-    limit: int = typer.Option(0, "--limit", "-n", help="Max quality-pass product_ids (0 = all)"),
+    limit: int = typer.Option(
+        0, "--limit", "-n", help="Max product_ids to enqueue (0 = all)"
+    ),
     force: bool = typer.Option(
         False,
         "--force",
@@ -2925,8 +2980,8 @@ def enqueue_es(
         False,
         "--reset-queue/--no-reset-queue",
         help=(
-            "Clear Redis queue list (+ drop obsolete seen set) before rebuild. "
-            "Dedupe is always against ES_PRODUCTS_INDEX, not Redis seen."
+            "Clear Redis queue list and seen set before rebuild. "
+            "Reviews-priority mode uses seen to dedupe US/COM copies."
         ),
     ),
     skip_existing_products: bool = typer.Option(
@@ -2980,7 +3035,17 @@ def enqueue_es(
     sort_by: str = typer.Option(
         "reviews,desc",
         "--sort-by",
-        help="Sort each phase before LPUSH: reviews,desc|rating,desc|none",
+        help="Legacy quality/rest sort: reviews,desc|rating,desc|none",
+    ),
+    reviews_priority: bool | None = typer.Option(
+        None,
+        "--reviews-priority/--no-reviews-priority",
+        help="Stream all pending IDs as reviews > threshold DESC, unknown, then <= threshold DESC",
+    ),
+    reviews_threshold: int | None = typer.Option(
+        None,
+        "--reviews-threshold",
+        help="High-review cutoff (default: ENQUEUE_REVIEWS_PRIORITY_THRESHOLD=90)",
     ),
     category_blacklist: bool | None = typer.Option(
         None,
@@ -3000,12 +3065,15 @@ def enqueue_es(
       - **not** yet in ``user1_aliexpress_us_products`` (sole dedupe source)
       - not in category blacklist (clothing / adult) when enabled
 
-    Phase 1 (quality): price/rating/reviews/sold gates, sorted by reviews DESC.
-    Phase 2 (rest): remaining not-in-products URLs, sorted by reviews DESC
-    (missing reviews last). LPUSH+BRPOP → workers finish phase 1 first.
+    Default streaming priority:
+      1) reviews > 90, reviews DESC
+      2) reviews missing/invalid
+      3) reviews <= 90, reviews DESC
 
-    ``--reset-queue`` clears the Redis list (and obsolete seen key) then rebuilds.
-    Redis seen is **not** used for enqueue-es dedupe.
+    ``--no-reviews-priority`` restores the legacy quality/rest phases.
+
+    ``--reset-queue`` clears the Redis list and seen key before rebuilding.
+    Reviews-priority mode uses Redis seen to dedupe duplicate US/COM URL docs.
     """
     from aliexpress_ds.category_blacklist import filter_items_by_category_blacklist
     from aliexpress_ds.queue import get_product_queue
@@ -3038,6 +3106,16 @@ def enqueue_es(
         settings.enqueue_category_blacklist
         if category_blacklist is None
         else category_blacklist
+    )
+    use_reviews_priority = (
+        settings.enqueue_reviews_priority
+        if reviews_priority is None
+        else reviews_priority
+    )
+    q_reviews_threshold = (
+        settings.enqueue_reviews_priority_threshold
+        if reviews_threshold is None
+        else max(0, int(reviews_threshold))
     )
     q_max_price = settings.enqueue_max_price if max_price is None else max_price
     q_min_rating = settings.enqueue_min_rating if min_rating is None else min_rating
@@ -3098,6 +3176,133 @@ def enqueue_es(
         console.print(f"Loading product_ids from {settings.es_products_index} …")
         existing = load_existing_product_ids(es, settings.es_products_index)
         console.print(f"Already in products index: {len(existing)}")
+
+    if use_reviews_priority:
+        console.print(
+            "Reviews priority ON: "
+            f"reviews>{q_reviews_threshold} DESC → missing/invalid → "
+            f"reviews≤{q_reviews_threshold} DESC"
+        )
+        console.print(
+            "Streaming mode: quality price/rating/sold gates are not applied; "
+            "existing products and category blacklist are still excluded"
+        )
+        if force:
+            console.print(
+                "[yellow]--force ignored in reviews-priority mode so duplicate "
+                "US/COM product_ids remain deduplicated[/yellow]"
+            )
+
+        queue = None if dry_run else get_product_queue(settings)
+        if queue is not None and reset_queue:
+            cleared = queue.clear(clear_seen=True)
+            console.print(
+                f"[yellow]Cleared queue[/yellow] "
+                f"queue_removed={cleared.get('queue_removed')} "
+                f"seen_removed={cleared.get('seen_removed')}"
+            )
+
+        batch: list[dict] = []
+        batch_phase = ""
+        phase_counts = {
+            "reviews_high": 0,
+            "reviews_unknown": 0,
+            "reviews_low": 0,
+        }
+        scanned_counts = dict.fromkeys(phase_counts, 0)
+        blocked_total = 0
+        skipped_total = 0
+        enqueued_total = 0
+        dry_seen: set[str] = set()
+        samples: list[dict] = []
+
+        def _flush_priority_batch() -> None:
+            nonlocal batch, blocked_total, skipped_total, enqueued_total
+            if not batch:
+                return
+            current = batch
+            batch = []
+            if use_category_blacklist:
+                current, blocked = filter_items_by_category_blacklist(
+                    current,
+                    blacklist_file=settings.enqueue_category_blacklist_file,
+                    env_keywords=os.environ.get(
+                        "ENQUEUE_CATEGORY_BLACKLIST_KEYWORDS", ""
+                    ),
+                )
+                blocked_total += blocked
+            if limit and limit > 0:
+                remaining = max(0, int(limit) - enqueued_total)
+                current = current[:remaining]
+            if not current:
+                return
+            if dry_run:
+                new = 0
+                skipped = 0
+                for item in current:
+                    pid = str(item.get("product_id") or "")
+                    if not pid or pid in dry_seen:
+                        skipped += 1
+                        continue
+                    dry_seen.add(pid)
+                    phase_counts[batch_phase] += 1
+                    new += 1
+                    if len(samples) < 10:
+                        samples.append(item)
+            else:
+                assert queue is not None
+                new, skipped = queue.enqueue_many(
+                    current,
+                    force=False,
+                    use_seen=True,
+                )
+                phase_counts[batch_phase] += new
+            enqueued_total += new
+            skipped_total += skipped
+
+        for phase, item in iter_urls_by_reviews_priority(
+            es,
+            urls_index=settings.es_urls_index,
+            existing_ids=existing if skip_existing_products else set(),
+            threshold=q_reviews_threshold,
+            max_valid_reviews=settings.enqueue_reviews_max_valid,
+        ):
+            if limit and limit > 0 and enqueued_total >= int(limit):
+                break
+            if batch_phase and phase != batch_phase:
+                _flush_priority_batch()
+                if limit and limit > 0 and enqueued_total >= int(limit):
+                    break
+            batch_phase = phase
+            scanned_counts[phase] += 1
+            batch.append(item)
+            if len(batch) >= 1000:
+                _flush_priority_batch()
+        _flush_priority_batch()
+
+        mode = "Would enqueue" if dry_run else "Enqueued"
+        console.print(
+            f"[green]{mode}[/green] total={enqueued_total} "
+            f"high={phase_counts['reviews_high']} "
+            f"unknown={phase_counts['reviews_unknown']} "
+            f"low={phase_counts['reviews_low']} "
+            f"duplicates/skipped={skipped_total} blacklist={blocked_total}"
+        )
+        console.print(
+            "Scanned: "
+            f"high={scanned_counts['reviews_high']} "
+            f"unknown={scanned_counts['reviews_unknown']} "
+            f"low={scanned_counts['reviews_low']}"
+        )
+        if dry_run:
+            for item in samples:
+                console.print(
+                    f"  {item['product_id']} reviews={item.get('reviews')} "
+                    f"sold={item.get('sold_count')} cat={item.get('category')}"
+                )
+        elif queue is not None:
+            console.print(f"queue_len={queue.length()} → {settings.redis_queue_key}")
+        return
 
     if use_quality:
         console.print(
@@ -3185,7 +3390,8 @@ def enqueue_es(
             pending.append(
                 {
                     "product_id": pid,
-                    "url": doc.get("url") or f"https://www.aliexpress.us/item/{pid}.html",
+                    "url": doc.get("url")
+                    or f"https://www.aliexpress.us/item/{pid}.html",
                     "source": doc.get("source") or "aliexpress.us",
                     "title": doc.get("title"),
                     "category": doc.get("category"),
@@ -3257,9 +3463,7 @@ def enqueue_es(
         )
     # Dedupe is already applied via ES products index (skip_existing).
     # Do not consult Redis seen — use_seen=False.
-    new, skipped = q.enqueue_many(
-        pending, force=bool(force), use_seen=bool(force)
-    )
+    new, skipped = q.enqueue_many(pending, force=bool(force), use_seen=bool(force))
     console.print(
         f"[green]Enqueued[/green] new={new} skipped={skipped} "
         f"quality={quality_count} rest={len(rest_pending)} "
@@ -3382,7 +3586,7 @@ def queue_worker(
     daily_limit: int = typer.Option(
         -1,
         "--daily-limit",
-        help="Max API calls/day (Beijing). <0 uses ALIEXPRESS_DAILY_LIMIT",
+        help="Pacing basis (calls/day); never a local stop. <0 uses configured value",
     ),
     concurrency: int = typer.Option(
         -1,
@@ -3452,8 +3656,8 @@ def queue_worker(
 
     interval = settings.aliexpress_min_interval_sec if delay < 0 else delay
     quota = settings.aliexpress_daily_limit if daily_limit < 0 else daily_limit
-    workers = 1 if once else (
-        settings.queue_concurrency if concurrency < 0 else concurrency
+    workers = (
+        1 if once else (settings.queue_concurrency if concurrency < 0 else concurrency)
     )
     workers = max(1, int(workers))
 
@@ -3484,7 +3688,8 @@ def queue_worker(
         console.print(
             f"Worker listening {settings.redis_queue_key} "
             f"(len={qlen}) → ES={settings.es_products_index if index_es else 'off'} "
-            f"concurrency={workers} pace≥{interval:.2f}s daily≤{quota or '∞'} "
+            f"concurrency={workers} pace≥{interval:.2f}s "
+            f"daily_pace_basis={quota or 'default'} no_local_stop "
             f"retries≤{settings.aliexpress_max_retries}"
         )
 
@@ -3495,7 +3700,10 @@ def queue_worker(
                 err_console.print(f"[yellow]skip bad job:[/yellow] {job}")
                 return
 
-            url = str(job.get("url") or "").strip() or f"https://www.aliexpress.us/item/{pid}.html"
+            url = (
+                str(job.get("url") or "").strip()
+                or f"https://www.aliexpress.us/item/{pid}.html"
+            )
             source = str(job.get("source") or "aliexpress.us").strip()
             item = {
                 "product_id": pid,
@@ -3544,7 +3752,7 @@ def queue_worker(
                     f"pending_es={es_buf.pending if es_buf else 0} "
                     f"fetched={done_n} "
                     f"interval≈{limiter.effective_interval:.2f}s "
-                    f"remaining≈{limiter.remaining_today}"
+                    f"calls_today≈{limiter.calls_today}"
                 )
 
                 if once or (max_jobs and done_n >= max_jobs):
@@ -3579,7 +3787,9 @@ def queue_worker(
                 if _auth_fatal(str(exc)):
                     if requeue_on_rate_limit:
                         await q.requeue(job)
-                    err_console.print("[yellow]Stopping due to auth/sign error.[/yellow]")
+                    err_console.print(
+                        "[yellow]Stopping due to auth/sign error.[/yellow]"
+                    )
                     stop.set()
 
         async def slot_worker(slot: int) -> None:

@@ -39,11 +39,9 @@ class Settings(BaseSettings):
     es_categories_index: str = "user1_aliexpress_ds_categories"
     es_crawl_categories_index: str = "user1_aliexpress_crawl_categories"
 
-    # LOCAL client-side pacing (Beijing GMT+8). Prefer Redis aliexpress:oauth:apps
-    # fields daily_limit / min_interval_sec via ensure_app_credentials().
-    # Missing Redis daily_limit → 0 (unlimited local) + 1s interval.
-    # With daily_limit → interval = min(86400/daily_limit, 1s) unless min_interval_sec set.
-    # Intervals slower than 1 req/s are capped at 1.0s.
+    # Client-side pacing. daily_limit is only a pacing basis, never a local stop.
+    # Missing Redis daily_limit → 1s interval. With daily_limit →
+    # interval=min(86400/daily_limit, 1s); platform responses drive cooldowns.
     # Platform QPS / AppApiCallLimit ban seconds still come only from error responses.
     aliexpress_daily_limit: int = 0
     aliexpress_min_interval_sec: float = 1.0
@@ -57,6 +55,10 @@ class Settings(BaseSettings):
     enqueue_min_rating: float = 4.4
     enqueue_min_reviews: int = 300
     enqueue_min_sold_count: int = 500
+    # Detail-fetch queue order: reviews > threshold (desc), unknown, then <= threshold (desc).
+    enqueue_reviews_priority: bool = True
+    enqueue_reviews_priority_threshold: int = 90
+    enqueue_reviews_max_valid: int = 5_000_000
     # After quality-pass batch, also enqueue remaining not-in-products URLs
     # (reviews DESC). ENQUEUE_INCLUDE_MISSING_FIELDS=0 → quality-only.
     enqueue_include_missing_fields: bool = True
@@ -90,7 +92,9 @@ class Settings(BaseSettings):
         missing = []
         if not self.aliexpress_app_key or self.aliexpress_app_key.startswith("your_"):
             missing.append("ALIEXPRESS_APP_KEY")
-        if not self.aliexpress_app_secret or self.aliexpress_app_secret.startswith("your_"):
+        if not self.aliexpress_app_secret or self.aliexpress_app_secret.startswith(
+            "your_"
+        ):
             missing.append(
                 "ALIEXPRESS_APP_SECRET (or register app in Redis aliexpress:oauth:apps)"
             )

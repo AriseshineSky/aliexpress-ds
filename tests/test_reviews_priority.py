@@ -1,0 +1,76 @@
+from aliexpress_ds.es import (
+    iter_urls_by_reviews_priority,
+    urls_reviews_priority_phases,
+)
+
+
+def test_reviews_priority_phases_are_disjoint_and_ordered() -> None:
+    phases = urls_reviews_priority_phases(
+        threshold=90,
+        max_valid_reviews=5_000_000,
+    )
+
+    assert [phase for phase, _query, _sort in phases] == [
+        "reviews_high",
+        "reviews_unknown",
+        "reviews_low",
+    ]
+    high_range = phases[0][1]["bool"]["filter"][1]["range"]["reviews"]
+    low_range = phases[2][1]["bool"]["filter"][1]["range"]["reviews"]
+    assert high_range == {"gt": 90, "lte": 5_000_000}
+    assert low_range == {"gte": 0, "lte": 90}
+    assert phases[0][2][0]["reviews"]["order"] == "desc"
+    assert phases[2][2][0]["reviews"]["order"] == "desc"
+
+
+class _FakeEs:
+    def __init__(self) -> None:
+        self.search_calls: list[dict] = []
+        self._scroll_calls = 0
+
+    def search(self, **kwargs):
+        self.search_calls.append(kwargs)
+        phase = len(self.search_calls)
+        docs = {
+            1: [
+                {"_id": "us_1", "_source": {"product_id": "1", "reviews": 500}},
+                {"_id": "us_2", "_source": {"product_id": "2", "reviews": 100}},
+            ],
+            2: [
+                {"_id": "us_3", "_source": {"product_id": "3"}},
+            ],
+            3: [
+                {"_id": "us_4", "_source": {"product_id": "4", "reviews": 90}},
+                {"_id": "us_5", "_source": {"product_id": "5", "reviews": 10}},
+            ],
+        }[phase]
+        return {"_scroll_id": f"scroll-{phase}", "hits": {"hits": docs}}
+
+    def scroll(self, **_kwargs):
+        self._scroll_calls += 1
+        return {"_scroll_id": "done", "hits": {"hits": []}}
+
+    def clear_scroll(self, **_kwargs):
+        return None
+
+
+def test_iter_urls_streams_high_unknown_low_and_skips_existing() -> None:
+    es = _FakeEs()
+
+    rows = list(
+        iter_urls_by_reviews_priority(
+            es,
+            urls_index="urls",
+            existing_ids={"2"},
+            threshold=90,
+        )
+    )
+
+    assert [(phase, row["product_id"]) for phase, row in rows] == [
+        ("reviews_high", "1"),
+        ("reviews_unknown", "3"),
+        ("reviews_low", "4"),
+        ("reviews_low", "5"),
+    ]
+    assert es.search_calls[0]["sort"][0]["reviews"]["order"] == "desc"
+    assert es.search_calls[2]["sort"][0]["reviews"]["order"] == "desc"

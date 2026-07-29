@@ -30,6 +30,7 @@ def scroll_sources(
     page_size: int = 2000,
     keep_alive: str = "10m",
     query: dict[str, Any] | None = None,
+    sort: list[dict[str, Any]] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Scroll docs. keep_alive must cover time to finish consuming each page.
 
@@ -42,6 +43,7 @@ def scroll_sources(
         scroll=keep_alive,
         _source=source_fields,
         query=query or {"match_all": {}},
+        sort=sort,
     )
     scroll_id = resp.get("_scroll_id")
     try:
@@ -109,9 +111,142 @@ def urls_missing_fields_query(
     }
 
 
+def urls_reviews_priority_phases(
+    *,
+    threshold: int = 90,
+    max_valid_reviews: int = 5_000_000,
+) -> list[tuple[str, dict[str, Any], list[dict[str, Any]]]]:
+    """ES queries for high reviews, unknown reviews, then low reviews.
+
+    The phases are mutually exclusive and collectively cover every document
+    that has a product_id. Corrupt values are treated as unknown so an outlier
+    cannot jump ahead of valid high-review products.
+    """
+    threshold = max(0, int(threshold))
+    max_valid_reviews = max(threshold, int(max_valid_reviews))
+    has_pid = {"exists": {"field": "product_id"}}
+    reviews_desc = [
+        {"reviews": {"order": "desc", "missing": "_last"}},
+        {"product_id": {"order": "asc"}},
+    ]
+    return [
+        (
+            "reviews_high",
+            {
+                "bool": {
+                    "filter": [
+                        has_pid,
+                        {
+                            "range": {
+                                "reviews": {
+                                    "gt": threshold,
+                                    "lte": max_valid_reviews,
+                                }
+                            }
+                        },
+                    ]
+                }
+            },
+            reviews_desc,
+        ),
+        (
+            "reviews_unknown",
+            {
+                "bool": {
+                    "filter": [has_pid],
+                    "should": [
+                        {"bool": {"must_not": [{"exists": {"field": "reviews"}}]}},
+                        {"range": {"reviews": {"lt": 0}}},
+                        {"range": {"reviews": {"gt": max_valid_reviews}}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            },
+            [{"product_id": {"order": "asc"}}],
+        ),
+        (
+            "reviews_low",
+            {
+                "bool": {
+                    "filter": [
+                        has_pid,
+                        {
+                            "range": {
+                                "reviews": {
+                                    "gte": 0,
+                                    "lte": threshold,
+                                }
+                            }
+                        },
+                    ]
+                }
+            },
+            reviews_desc,
+        ),
+    ]
+
+
+def iter_urls_by_reviews_priority(
+    es: Elasticsearch,
+    *,
+    urls_index: str,
+    existing_ids: set[str] | None = None,
+    threshold: int = 90,
+    max_valid_reviews: int = 5_000_000,
+    page_size: int = 2000,
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Stream pending URL docs in review-priority order without materializing all."""
+    existing = existing_ids or set()
+    source_fields = [
+        "product_id",
+        "url",
+        "source",
+        "title",
+        "category",
+        "price",
+        "rating",
+        "reviews",
+        "sold_count",
+    ]
+    for phase, query, sort in urls_reviews_priority_phases(
+        threshold=threshold,
+        max_valid_reviews=max_valid_reviews,
+    ):
+        for doc in scroll_sources(
+            es,
+            urls_index,
+            source_fields=source_fields,
+            page_size=page_size,
+            keep_alive="10m",
+            query=query,
+            sort=sort,
+        ):
+            pid = str(doc.get("product_id") or "").strip()
+            if not pid or pid in existing:
+                continue
+            yield (
+                phase,
+                {
+                    "product_id": pid,
+                    "url": doc.get("url")
+                    or f"https://www.aliexpress.us/item/{pid}.html",
+                    "source": doc.get("source"),
+                    "title": doc.get("title"),
+                    "category": doc.get("category"),
+                    "price": doc.get("price"),
+                    "rating": doc.get("rating"),
+                    "reviews": doc.get("reviews"),
+                    "sold_count": doc.get("sold_count"),
+                    "es_id": doc.get("_id"),
+                },
+            )
+
+
 def load_existing_product_ids(es: Elasticsearch, products_index: str) -> set[str]:
     ids: set[str] = set()
-    for doc in scroll_sources(es, products_index, source_fields=["product_id", "sku", "url"]):
+    for doc in scroll_sources(
+        es, products_index, source_fields=["product_id", "sku", "url"]
+    ):
         pid = str(doc.get("product_id") or doc.get("sku") or "").strip()
         if pid:
             ids.add(pid)
@@ -147,7 +282,11 @@ def list_missing_urls(
     sold_count (any). Mutually exclusive with ``quality_filter`` — if both are
     set, ``missing_fields_only`` wins.
     """
-    existing = existing_ids if existing_ids is not None else load_existing_product_ids(es, products_index)
+    existing = (
+        existing_ids
+        if existing_ids is not None
+        else load_existing_product_ids(es, products_index)
+    )
     skip = exclude_ids or set()
     query: dict[str, Any] | None = None
     if missing_fields_only:
@@ -263,7 +402,9 @@ def upsert_url_docs(
         is_bs = bool(
             body.get("is_bestseller")
             or body.get("bestseller")
-            or ("bestseller" in tags if isinstance(tags, list) else tags == "bestseller")
+            or (
+                "bestseller" in tags if isinstance(tags, list) else tags == "bestseller"
+            )
         )
         if first_seen is None and is_bs:
             first_seen = body.get("bestseller_synced_at") or now
@@ -321,7 +462,9 @@ def upsert_url_docs(
                     else str(err)
                 )
         if ok == 0 and first_err:
-            raise RuntimeError(f"ES urls bulk failed (0/{len(actions)//2}): {first_err}")
+            raise RuntimeError(
+                f"ES urls bulk failed (0/{len(actions) // 2}): {first_err}"
+            )
         return ok
     return len(actions) // 2
 

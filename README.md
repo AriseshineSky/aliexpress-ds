@@ -121,8 +121,8 @@ REDIS_QUEUE_SEEN_KEY=aliexpress-ds:products:seen
 ```
 
 ```bash
-# 1) 每 2h 清空 Redis 队列，再按质量门优先、reviews DESC 重建
-#    去重只查 ES_PRODUCTS_INDEX（不依赖 Redis seen）
+# 1) 每 2h 清空 Redis 队列，按 reviews>90 DESC → 缺失 → reviews≤90 DESC 重建
+#    已抓详情由 ES_PRODUCTS_INDEX 排除；Redis seen 去重 US/COM 重复 ID
 #    （systemd: aliexpress-ds-enqueue.timer → enqueue-es --reset-queue）
 uv run aliexpress-ds enqueue-es --reset-queue
 uv run aliexpress-ds enqueue-es --reset-queue -n 500
@@ -143,6 +143,8 @@ uv run aliexpress-ds queue-worker
 
 | 变量 | 默认 | 条件 |
 |------|------|------|
+| `ENQUEUE_REVIEWS_PRIORITY` | `1` | 启用三阶段流式优先级（关闭后使用下列旧质量门） |
+| `ENQUEUE_REVIEWS_PRIORITY_THRESHOLD` | `90` | 先发 `reviews>90`，缺失其次，`reviews≤90` 最后 |
 | `ENQUEUE_QUALITY_FILTER` | `1` | 启用过滤 |
 | `ENQUEUE_MAX_PRICE` | `100` | `price < 100` |
 | `ENQUEUE_MIN_RATING` | `4.4` | `rating ≥ 4.4` |
@@ -251,13 +253,13 @@ uv run aliexpress-ds app-limits-show -k 539674
 
 | 来源 | 日帽 | 间隔 |
 |------|------|------|
-| Redis `daily_limit=N` | N | `min(86400/N, 1s)`（或显式 `min_interval_sec`；慢于 1 次/秒会封顶为 1s） |
-| Redis 无 `daily_limit` | 无限 | **1.0s**（平台 ban 仍生效） |
-| env 回退（无 Redis 注册） | `ALIEXPRESS_DAILY_LIMIT` 默认 0 | `ALIEXPRESS_MIN_INTERVAL_SEC` 默认 1.0 |
+| Redis `daily_limit=N` | **仅用于计算速率，不在本地停工** | `min(86400/N, 1s)` |
+| Redis 无 `daily_limit` | 不设本地日帽 | **1.0s**（平台 ban 仍生效） |
+| env 回退（无 Redis 注册） | 同样仅作速率依据 | 默认 **1.0s** |
 
 查看：`uv run aliexpress-ds rate-status`（本地计数 + 最近一次平台错误原文）。
 
-`IopClient.execute` 统一：限速 → 发请求 → 解析流控 → 等待官方 ban 秒数 → 重试；日配额耗尽抛 `DailyQuotaExhausted` 并停工。
+`IopClient.execute` 统一：按计算速率发请求 → 解析平台流控 → 等待官方返回的 ban 秒数 → 重试。本地计数永不触发停工；只有平台明确返回日配额耗尽才等待到北京时间次日。
 
 每行 JSONL 结构：
 
