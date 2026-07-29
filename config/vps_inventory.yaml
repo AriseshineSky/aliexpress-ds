@@ -15,19 +15,21 @@ vps:
     min_interval_sec: 1.0            # capped: 86400/70000≈1.23 → 1s (min 1req/s)
     daily_limit: 70000               # Redis aliexpress:oauth:apps
     queue_concurrency: 1
-    notes: "default DEPLOY_HOST in scripts/deploy_vps.sh; ALIEXPRESS_DAILY_LIMIT on VPS .env"
+    ssh_key: ~/.ssh/id_ed25519       # also accepts google_compute_engine
+    notes: "default DEPLOY_HOST in scripts/deploy_vps.sh; enqueue+bestsellers timers"
     updated_at: "2026-07-28"
 
   - host: 35.202.167.107
     ssh: Admin@35.202.167.107
-    label: ""
+    label: c1002us
     remote_dir: /home/Admin/aliexpress-ds
     app_key: "539578"
-    app_label: ""
+    app_label: "539578"
     min_interval_sec: 1.0            # capped: 86400/50000=1.728 → 1s (min 1req/s)
     daily_limit: 50000               # Redis aliexpress:oauth:apps
     queue_concurrency: 1
-    notes: "DEPLOY_HOST=Admin@35.202.167.107 ./scripts/deploy_vps.sh; ALIEXPRESS_DAILY_LIMIT on VPS .env"
+    ssh_key: ~/.ssh/google_compute_engine
+    notes: "SSH_KEY=~/.ssh/google_compute_engine DEPLOY_HOST=Admin@35.202.167.107 ./scripts/deploy_vps.sh"
     updated_at: "2026-07-28"
 
   - host: 34.121.255.1
@@ -39,5 +41,32 @@ vps:
     min_interval_sec: 1.0            # capped: 86400/50000=1.728 → 1s (min 1req/s)
     daily_limit: 50000               # Redis aliexpress:oauth:apps
     queue_concurrency: 1
+    ssh_key: ~/.ssh/google_compute_engine
     notes: "SSH_KEY=~/.ssh/google_compute_engine DEPLOY_HOST=Admin@34.121.255.1 ./scripts/deploy_vps.sh"
+    updated_at: "2026-07-28"
+
+  - host: 35.223.88.182
+    ssh: Admin@35.223.88.182
+    label: ali-veregloria153
+    remote_dir: /home/Admin/aliexpress-ds
+    app_key: "540124"
+    app_label: veregloria153@gmail.com
+    min_interval_sec: 1.0            # no Redis daily_limit → default 1s
+    daily_limit: null                # Redis unset → local unlimited
+    queue_concurrency: 1
+    ssh_key: ~/.ssh/google_compute_engine
+    notes: "SSH_KEY=~/.ssh/google_compute_engine DEPLOY_HOST=Admin@35.223.88.182 ./scripts/deploy_vps.sh"
+    updated_at: "2026-07-28"
+
+  - host: 34.28.197.124
+    ssh: Admin@34.28.197.124
+    label: ali-eli
+    remote_dir: /home/Admin/aliexpress-ds
+    app_key: "540244"
+    app_label: vps3
+    min_interval_sec: 1.0            # no Redis daily_limit → default 1s
+    daily_limit: null                # Redis unset → local unlimited
+    queue_concurrency: 1
+    ssh_key: gcloud                  # Admin key not in local ~/.ssh; use: gcloud compute ssh ali-eli --zone=us-central1-a
+    notes: "deploy via gcloud compute ssh ali-eli --zone=us-central1-a (sudo -u Admin); token for 540244 may need OAuth"
     updated_at: "2026-07-28"
