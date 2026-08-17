@@ -155,6 +155,39 @@ def _load_pending_from_urls_file(path: Path) -> list[dict]:
     return rows
 
 
+def _load_pending_ids_from_file(path: Path, *, source: str) -> list[dict]:
+    """Load product_id rows from a plain (id/URL per line) or JSONL file."""
+    rows: list[dict] = []
+    seen: set[str] = set()
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            url = ""
+            if line[0] == "{":
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                raw = str(obj.get("url") or obj.get("product_id") or "").strip()
+                url = str(obj.get("url") or "").strip()
+            else:
+                raw = line.split()[0]
+            try:
+                pid = extract_product_id(raw)
+            except ValueError as exc:
+                err_console.print(f"[yellow]skip line:[/yellow] {line!r} ({exc})")
+                continue
+            if pid in seen:
+                continue
+            seen.add(pid)
+            if not url or url == pid:
+                url = f"https://www.aliexpress.us/item/{pid}.html"
+            rows.append({"product_id": pid, "url": url, "source": source})
+    return rows
+
+
 def _write_product_row(
     *,
     summary,
@@ -3569,6 +3602,138 @@ def enqueue_cny(
     new, skipped = q.enqueue_many(pending, force=force)
     console.print(
         f"[green]Enqueued CNY refresh[/green] new={new} skipped={skipped} "
+        f"queue_len={q.length()} → {settings.redis_queue_key}"
+    )
+
+
+@app.command("enqueue-ids")
+def enqueue_ids(
+    ids: list[str] = typer.Argument(
+        None,
+        help="Product IDs or URLs (space-separated); or use --file",
+    ),
+    ids_file: Optional[Path] = typer.Option(
+        None,
+        "--file",
+        "-f",
+        help="File of product_ids/URLs: one per line or JSONL ({product_id,url})",
+    ),
+    source: str = typer.Option(
+        "aliexpress.us",
+        "--source",
+        help="Source tag stored on each job (default aliexpress.us)",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Re-enqueue even if product_id is already in Redis seen set "
+        "(drops stale copies before pushing)",
+    ),
+    no_priority: bool = typer.Option(
+        False,
+        "--no-priority",
+        help="LPUSH instead of priority RPUSH (jobs go to the back of the queue)",
+    ),
+    skip_existing: bool = typer.Option(
+        False,
+        "--skip-existing/--include-existing",
+        help="Drop ids already in ES_PRODUCTS_INDEX (requires ES)",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report what would be enqueued without touching Redis",
+    ),
+) -> None:
+    """Push explicit product_ids into the Redis queue (priority RPUSH by default).
+
+    Ids are RPUSHed so BRPOP queue-workers consume them before the older LPUSH
+    backlog (i.e. these products are fetched first).
+
+    Examples:
+      uv run aliexpress-ds enqueue-ids 1005004506189269 1005004506189270
+      uv run aliexpress-ds enqueue-ids -f ids.txt --dry-run
+      uv run aliexpress-ds enqueue-ids -f ids.txt --skip-existing --force
+    """
+    from aliexpress_ds.queue import get_product_queue
+
+    settings = get_settings()
+    try:
+        if not dry_run:
+            settings.require_queue_redis()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    items: list[dict] = []
+    for raw in ids or []:
+        raw = (raw or "").strip()
+        if not raw:
+            continue
+        try:
+            pid = extract_product_id(raw)
+        except ValueError as exc:
+            err_console.print(f"[yellow]skip:[/yellow] {exc}")
+            continue
+        url = raw if raw.startswith("http") and "/item/" in raw else None
+        items.append(
+            {
+                "product_id": pid,
+                "url": url or f"https://www.aliexpress.us/item/{pid}.html",
+                "source": source,
+            }
+        )
+
+    if ids_file is not None:
+        if not ids_file.exists():
+            err_console.print(f"[red]file not found:[/red] {ids_file}")
+            raise typer.Exit(code=1)
+        items.extend(_load_pending_ids_from_file(ids_file, source=source))
+
+    seen: dict[str, dict] = {}
+    for item in items:
+        seen.setdefault(item["product_id"], item)
+    items = list(seen.values())
+
+    if not items:
+        err_console.print("[red]no product ids given[/red]")
+        raise typer.Exit(code=2)
+
+    if skip_existing:
+        settings.require_es()
+        es = make_es_client(settings)
+        existing = load_existing_product_ids(es, settings.es_products_index)
+        before = len(items)
+        items = [it for it in items if it["product_id"] not in existing]
+        console.print(
+            f"skip-existing: {before} → {len(items)} "
+            f"(excl. {settings.es_products_index})"
+        )
+        if not items:
+            console.print("[yellow]all ids already in products index[/yellow]")
+            return
+
+    if dry_run:
+        console.print(
+            f"[yellow]dry-run[/yellow] would enqueue {len(items)} "
+            f"(priority={'on' if not no_priority else 'off'})"
+        )
+        for item in items[:10]:
+            console.print(f"  {item['product_id']}  {item['url']}")
+        if len(items) > 10:
+            console.print(f"  … {len(items) - 10} more")
+        return
+
+    q = get_product_queue(settings)
+    new, skipped = q.enqueue_many(
+        items,
+        force=force,
+        priority=not no_priority,
+        use_seen=True,
+    )
+    console.print(
+        f"[green]Enqueued[/green] new={new} skipped={skipped} "
+        f"priority={'RPUSH' if not no_priority else 'LPUSH'} "
         f"queue_len={q.length()} → {settings.redis_queue_key}"
     )
 
