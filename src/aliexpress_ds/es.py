@@ -7,6 +7,13 @@ from typing import Any, Iterator
 from elasticsearch import Elasticsearch
 
 from aliexpress_ds.config import Settings, get_settings
+from aliexpress_ds.fetch_errors import (
+    DS_DISCARD_FIELD,
+    DS_ERROR_CLASS_FIELD,
+    DS_ERROR_FIELD,
+    DS_FAILED_AT_FIELD,
+    discard_url_doc_ids,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +72,22 @@ def scroll_sources(
                 pass
 
 
+def exclude_discarded(query: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Skip URLs already marked unsaleable / not found / ship-prohibited."""
+    clause = {"term": {DS_DISCARD_FIELD: True}}
+    if not query:
+        return {"bool": {"must_not": [clause]}}
+    bool_q = query.get("bool")
+    if isinstance(bool_q, dict):
+        inner = dict(bool_q)
+        must_not = list(inner.get("must_not") or [])
+        if clause not in must_not:
+            must_not.append(clause)
+        inner["must_not"] = must_not
+        return {**query, "bool": inner}
+    return {"bool": {"must": [query], "must_not": [clause]}}
+
+
 def urls_quality_query(
     *,
     max_price: float | None = None,
@@ -82,7 +105,7 @@ def urls_quality_query(
         must.append({"range": {"reviews": {"gte": int(min_reviews)}}})
     if min_sold_count is not None:
         must.append({"range": {"sold_count": {"gte": int(min_sold_count)}}})
-    return {"bool": {"must": must}}
+    return exclude_discarded({"bool": {"must": must}})
 
 
 def urls_missing_fields_query(
@@ -102,13 +125,15 @@ def urls_missing_fields_query(
         {"bool": {"must_not": [{"exists": {"field": "reviews"}}]}},
         {"bool": {"must_not": [{"exists": {"field": "sold_count"}}]}},
     ]
-    return {
-        "bool": {
-            "must": must,
-            "should": should,
-            "minimum_should_match": 1,
+    return exclude_discarded(
+        {
+            "bool": {
+                "must": must,
+                "should": should,
+                "minimum_should_match": 1,
+            }
         }
-    }
+    )
 
 
 def urls_reviews_priority_phases(
@@ -125,63 +150,86 @@ def urls_reviews_priority_phases(
     threshold = max(0, int(threshold))
     max_valid_reviews = max(threshold, int(max_valid_reviews))
     has_pid = {"exists": {"field": "product_id"}}
-    reviews_desc = [
+    created_at_desc = [
+        {
+            "created_at": {
+                "order": "desc",
+                "unmapped_type": "date",
+                "missing": "_last",
+            }
+        },
+        {"product_id": {"order": "asc"}},
+    ]
+    reviews_then_recent = [
         {"reviews": {"order": "desc", "missing": "_last"}},
+        {
+            "created_at": {
+                "order": "desc",
+                "unmapped_type": "date",
+                "missing": "_last",
+            }
+        },
         {"product_id": {"order": "asc"}},
     ]
     return [
         (
             "reviews_high",
-            {
-                "bool": {
-                    "filter": [
-                        has_pid,
-                        {
-                            "range": {
-                                "reviews": {
-                                    "gt": threshold,
-                                    "lte": max_valid_reviews,
+            exclude_discarded(
+                {
+                    "bool": {
+                        "filter": [
+                            has_pid,
+                            {
+                                "range": {
+                                    "reviews": {
+                                        "gt": threshold,
+                                        "lte": max_valid_reviews,
+                                    }
                                 }
-                            }
-                        },
-                    ]
+                            },
+                        ]
+                    }
                 }
-            },
-            reviews_desc,
+            ),
+            reviews_then_recent,
         ),
         (
             "reviews_unknown",
-            {
-                "bool": {
-                    "filter": [has_pid],
-                    "should": [
-                        {"bool": {"must_not": [{"exists": {"field": "reviews"}}]}},
-                        {"range": {"reviews": {"lt": 0}}},
-                        {"range": {"reviews": {"gt": max_valid_reviews}}},
-                    ],
-                    "minimum_should_match": 1,
+            exclude_discarded(
+                {
+                    "bool": {
+                        "filter": [has_pid],
+                        "should": [
+                            {"bool": {"must_not": [{"exists": {"field": "reviews"}}]}},
+                            {"range": {"reviews": {"lt": 0}}},
+                            {"range": {"reviews": {"gt": max_valid_reviews}}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
                 }
-            },
-            [{"product_id": {"order": "asc"}}],
+            ),
+            created_at_desc,
         ),
         (
             "reviews_low",
-            {
-                "bool": {
-                    "filter": [
-                        has_pid,
-                        {
-                            "range": {
-                                "reviews": {
-                                    "gte": 0,
-                                    "lte": threshold,
+            exclude_discarded(
+                {
+                    "bool": {
+                        "filter": [
+                            has_pid,
+                            {
+                                "range": {
+                                    "reviews": {
+                                        "gte": 0,
+                                        "lte": threshold,
+                                    }
                                 }
-                            }
-                        },
-                    ]
+                            },
+                        ]
+                    }
                 }
-            },
-            reviews_desc,
+            ),
+            created_at_desc,
         ),
     ]
 
@@ -207,6 +255,7 @@ def iter_urls_by_reviews_priority(
         "rating",
         "reviews",
         "sold_count",
+        "created_at",
     ]
     for phase, query, sort in urls_reviews_priority_phases(
         threshold=threshold,
@@ -288,7 +337,7 @@ def list_missing_urls(
         else load_existing_product_ids(es, products_index)
     )
     skip = exclude_ids or set()
-    query: dict[str, Any] | None = None
+    query: dict[str, Any] | None
     if missing_fields_only:
         query = urls_missing_fields_query(max_price=max_price)
     elif quality_filter:
@@ -298,6 +347,8 @@ def list_missing_urls(
             min_reviews=min_reviews,
             min_sold_count=min_sold_count,
         )
+    else:
+        query = exclude_discarded()
     missing: list[dict[str, Any]] = []
     for doc in scroll_sources(
         es,
@@ -578,6 +629,149 @@ class EsProductBuffer:
             self._errors += 1
             logger.warning(
                 "ES bulk flush failed (%s docs): %s",
+                len(batch),
+                exc,
+            )
+            return 0
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._wake.wait(timeout=self.flush_interval_sec)
+            self._wake.clear()
+            with self._lock:
+                if not self._buf:
+                    continue
+                batch = self._buf
+                self._buf = []
+            if batch:
+                self._write(batch)
+
+
+def ensure_urls_discard_mapping(es: Elasticsearch, urls_index: str) -> None:
+    es.indices.put_mapping(
+        index=urls_index,
+        properties={
+            DS_DISCARD_FIELD: {"type": "boolean"},
+            DS_ERROR_CLASS_FIELD: {"type": "keyword"},
+            DS_ERROR_FIELD: {"type": "keyword"},
+            DS_FAILED_AT_FIELD: {"type": "date"},
+        },
+    )
+
+
+def mark_discarded_url_docs(
+    es: Elasticsearch,
+    urls_index: str,
+    items: list[dict[str, Any]],
+) -> int:
+    """Partial-update urls docs with ds_discard + error class. Skip missing ids."""
+    if not items:
+        return 0
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    actions: list[dict[str, Any]] = []
+    for item in items:
+        pid = str(item.get("product_id") or "").strip()
+        if not pid:
+            continue
+        error_class = str(item.get("error_class") or "").strip() or "unsaleable"
+        error = str(item.get("error") or "")[:200]
+        doc = {
+            DS_DISCARD_FIELD: True,
+            DS_ERROR_CLASS_FIELD: error_class,
+            DS_ERROR_FIELD: error,
+            DS_FAILED_AT_FIELD: item.get("failed_at") or now,
+        }
+        for doc_id in discard_url_doc_ids(
+            pid,
+            source=item.get("source"),
+            es_id=item.get("es_id"),
+        ):
+            actions.append(
+                {
+                    "update": {
+                        "_index": urls_index,
+                        "_id": doc_id,
+                        "retry_on_conflict": 2,
+                    }
+                }
+            )
+            actions.append({"doc": doc, "doc_as_upsert": False})
+    if not actions:
+        return 0
+    resp = es.bulk(operations=actions, refresh=False)
+    ok = 0
+    for entry in resp.get("items") or []:
+        upd = entry.get("update") or {}
+        if upd.get("status") in (200, 201):
+            ok += 1
+    return ok
+
+
+class EsDiscardBuffer:
+    """Background buffer to stamp ds_discard on urls docs after permanent DS misses."""
+
+    def __init__(
+        self,
+        es: Elasticsearch,
+        urls_index: str,
+        *,
+        max_size: int = 50,
+        flush_interval_sec: float = 2.0,
+    ):
+        self.es = es
+        self.urls_index = urls_index
+        self.max_size = max(1, int(max_size))
+        self.flush_interval_sec = max(0.2, float(flush_interval_sec))
+        self._buf: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._indexed = 0
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="es-discard-buffer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def indexed(self) -> int:
+        return self._indexed
+
+    def add(self, item: dict[str, Any]) -> None:
+        if not isinstance(item, dict) or not item.get("product_id"):
+            return
+        should_flush = False
+        with self._lock:
+            self._buf.append(item)
+            should_flush = len(self._buf) >= self.max_size
+        if should_flush:
+            self._wake.set()
+
+    def flush(self) -> int:
+        with self._lock:
+            batch = self._buf
+            self._buf = []
+        if not batch:
+            return 0
+        return self._write(batch)
+
+    def close(self) -> int:
+        self._stop.set()
+        self._wake.set()
+        self._thread.join(timeout=max(5.0, self.flush_interval_sec + 3.0))
+        return self.flush()
+
+    def _write(self, batch: list[dict[str, Any]]) -> int:
+        try:
+            n = mark_discarded_url_docs(self.es, self.urls_index, batch)
+            self._indexed += n
+            return n
+        except Exception as exc:
+            logger.warning(
+                "ES discard flush failed (%s docs): %s",
                 len(batch),
                 exc,
             )

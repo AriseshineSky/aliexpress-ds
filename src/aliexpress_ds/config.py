@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     redis_queue_url: str = ""
     redis_queue_key: str = "aliexpress-ds:products"
     redis_queue_seen_key: str = "aliexpress-ds:products:seen"
+    redis_queue_failed_key: str = "aliexpress-ds:products:failed"
+    redis_queue_failed_class_key: str = "aliexpress-ds:products:failed:class"
     redis_queue_brpop_timeout: int = 5
 
     # IOP sync gateway (Dropshipping)

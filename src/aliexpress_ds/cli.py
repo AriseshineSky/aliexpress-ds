@@ -13,13 +13,22 @@ from rich.table import Table
 
 from aliexpress_ds.config import get_settings
 from aliexpress_ds.es import (
+    EsDiscardBuffer,
     EsProductBuffer,
+    ensure_urls_discard_mapping,
     iter_missing_urls,
     iter_urls_by_reviews_priority,
     load_existing_product_ids,
     make_es_client,
+    mark_discarded_url_docs,
     scroll_sources,
     upsert_url_docs,
+)
+from aliexpress_ds.fetch_errors import (
+    DS_DISCARD_FIELD,
+    DS_ERROR_CLASS_FIELD,
+    classify_ds_error,
+    is_transient_ds_error,
 )
 from aliexpress_ds.iop_client import IopClient, IopError
 from aliexpress_ds.product import ProductService
@@ -2895,6 +2904,41 @@ def queue_status() -> None:
         raise typer.Exit(code=1) from exc
     console.print(f"queue={settings.redis_queue_key} len={q.length()}")
     console.print(f"seen={settings.redis_queue_seen_key} count={q.seen_count()}")
+    console.print(f"failed={settings.redis_queue_failed_key} count={q.failed_count()}")
+    classes = q.failed_class_counts()
+    if classes:
+        parts = " ".join(f"{k}={v}" for k, v in sorted(classes.items()))
+        console.print(f"failed_classes {parts}")
+    try:
+        settings.require_es()
+        es = make_es_client(settings)
+        resp = es.count(
+            index=settings.es_urls_index,
+            query={"term": {DS_DISCARD_FIELD: True}},
+        )
+        console.print(
+            f"es_discard={settings.es_urls_index} count={resp.get('count', 0)}"
+        )
+        agg = es.search(
+            index=settings.es_urls_index,
+            size=0,
+            query={"term": {DS_DISCARD_FIELD: True}},
+            aggs={
+                "by_class": {
+                    "terms": {"field": DS_ERROR_CLASS_FIELD, "size": 20}
+                }
+            },
+        )
+        buckets = (
+            (agg.get("aggregations") or {}).get("by_class") or {}
+        ).get("buckets") or []
+        if buckets:
+            parts = " ".join(
+                f"{b.get('key')}={b.get('doc_count')}" for b in buckets
+            )
+            console.print(f"es_discard_classes {parts}")
+    except Exception as exc:
+        console.print(f"[yellow]es discard stats unavailable:[/yellow] {exc}")
 
 
 @app.command("queue-clear")
@@ -2910,6 +2954,11 @@ def queue_clear(
         "--keep-seen",
         help="Only delete the pending list; keep the seen set",
     ),
+    clear_failed: bool = typer.Option(
+        False,
+        "--clear-failed",
+        help="Also delete the permanent DS failure set (default: keep)",
+    ),
 ) -> None:
     """Empty Redis product task queue (and seen set by default)."""
     from aliexpress_ds.queue import get_product_queue
@@ -2924,17 +2973,124 @@ def queue_clear(
     q = get_product_queue(settings)
     console.print(
         f"queue={settings.redis_queue_key} len={q.length()}  "
-        f"seen={settings.redis_queue_seen_key} count={q.seen_count()}"
+        f"seen={settings.redis_queue_seen_key} count={q.seen_count()}  "
+        f"failed={settings.redis_queue_failed_key} count={q.failed_count()}"
     )
     if not yes:
         err_console.print("[red]Refusing without --yes[/red]")
         raise typer.Exit(code=2)
-    stats = q.clear(clear_seen=not keep_seen)
+    stats = q.clear(clear_seen=not keep_seen, clear_failed=clear_failed)
     console.print(
         f"[green]Cleared[/green] queue_removed={stats['queue_removed']} "
-        f"seen_removed={stats['seen_removed']}"
+        f"seen_removed={stats['seen_removed']} "
+        f"failed_removed={stats.get('failed_removed', 0)}"
     )
-    console.print(f"queue len now={q.length()} seen now={q.seen_count()}")
+    console.print(
+        f"queue len now={q.length()} seen now={q.seen_count()} "
+        f"failed now={q.failed_count()}"
+    )
+
+
+@app.command("sync-discard")
+def sync_discard(
+    from_jsonl: Optional[Path] = typer.Option(
+        None,
+        "--from-jsonl",
+        help="Also ingest ok=false rows from queue-worker JSONL",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Stamp ds_discard on ES urls from Redis failed set (+ optional JSONL).
+
+    Next enqueue-es skips these IDs. Classes: unsaleable / not_found /
+    ship_prohibited / offline / bad_id.
+    """
+    from collections import Counter
+
+    from aliexpress_ds.queue import get_product_queue
+
+    settings = get_settings()
+    try:
+        settings.require_es()
+        settings.require_queue_redis()
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    q = get_product_queue(settings)
+    failed_ids = q.load_failed_ids()
+    classes = q.load_failed_classes()
+    rows: dict[str, dict] = {}
+    for pid in failed_ids:
+        rows[pid] = {
+            "product_id": pid,
+            "error_class": classes.get(pid) or "unknown",
+            "error": classes.get(pid) or "unknown",
+        }
+
+    jsonl_added = 0
+    if from_jsonl is not None:
+        if not from_jsonl.exists():
+            err_console.print(f"[red]JSONL not found:[/red] {from_jsonl}")
+            raise typer.Exit(code=1)
+        with from_jsonl.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"ok"' not in line or "false" not in line.lower():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("ok") is not False:
+                    continue
+                pid = str(obj.get("product_id") or "").strip()
+                if not pid:
+                    continue
+                cls = classify_ds_error(str(obj.get("error") or ""))
+                if not cls:
+                    continue
+                prev = rows.get(pid)
+                if prev and prev.get("error_class") in {
+                    "unsaleable",
+                    "not_found",
+                    "ship_prohibited",
+                    "offline",
+                    "bad_id",
+                }:
+                    continue
+                rows[pid] = {
+                    "product_id": pid,
+                    "source": obj.get("source"),
+                    "error_class": cls,
+                    "error": str(obj.get("error") or "")[:200],
+                }
+                jsonl_added += 1
+                q.mark_failed(pid, error_class=cls, error=str(obj.get("error") or ""))
+
+    counts = Counter(str(r.get("error_class") or "unknown") for r in rows.values())
+    console.print(
+        f"Discard candidates={len(rows)} jsonl_classified={jsonl_added} "
+        + " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    )
+    if dry_run or not rows:
+        return
+
+    es = make_es_client(settings)
+    ensure_urls_discard_mapping(es, settings.es_urls_index)
+    items = list(rows.values())
+    updated = 0
+    batch: list[dict] = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= 500:
+            updated += mark_discarded_url_docs(es, settings.es_urls_index, batch)
+            batch = []
+    if batch:
+        updated += mark_discarded_url_docs(es, settings.es_urls_index, batch)
+    console.print(
+        f"[green]ES urls discard updated[/green] doc_writes={updated} "
+        f"→ {settings.es_urls_index}"
+    )
 
 
 @app.command("rate-status")
@@ -3013,7 +3169,8 @@ def enqueue_es(
         False,
         "--reset-queue/--no-reset-queue",
         help=(
-            "Clear Redis queue list and seen set before rebuild. "
+            "Clear Redis queue list and seen set before rebuild "
+            "(keeps the permanent-failure set). "
             "Reviews-priority mode uses seen to dedupe US/COM copies."
         ),
     ),
@@ -3099,9 +3256,13 @@ def enqueue_es(
       - not in category blacklist (clothing / adult) when enabled
 
     Default streaming priority:
-      1) reviews > 90, reviews DESC
-      2) reviews missing/invalid
-      3) reviews <= 90, reviews DESC
+      1) reviews > 90, reviews DESC (newer first)
+      2) reviews missing/invalid, created_at DESC
+      3) reviews <= 90, created_at DESC
+
+    Permanent DS failures (unsaleable / not found / ship-to prohibited) live in
+    Redis ``REDIS_QUEUE_FAILED_KEY`` and are skipped. ``--reset-queue`` does
+    **not** clear that set.
 
     ``--no-reviews-priority`` restores the legacy quality/rest phases.
 
@@ -3210,15 +3371,26 @@ def enqueue_es(
         existing = load_existing_product_ids(es, settings.es_products_index)
         console.print(f"Already in products index: {len(existing)}")
 
+    queue_for_failed = None
+    try:
+        queue_for_failed = get_product_queue(settings)
+        failed_ids = queue_for_failed.load_failed_ids()
+        if failed_ids:
+            existing |= failed_ids
+            console.print(f"Permanent DS failures skipped: {len(failed_ids)}")
+    except Exception as exc:
+        console.print(f"[yellow]Could not load DS failed set:[/yellow] {exc}")
+
     if use_reviews_priority:
         console.print(
             "Reviews priority ON: "
-            f"reviews>{q_reviews_threshold} DESC → missing/invalid → "
-            f"reviews≤{q_reviews_threshold} DESC"
+            f"reviews>{q_reviews_threshold} DESC → missing/invalid by created_at DESC → "
+            f"reviews≤{q_reviews_threshold} by created_at DESC"
         )
         console.print(
             "Streaming mode: quality price/rating/sold gates are not applied; "
-            "existing products and category blacklist are still excluded"
+            "existing products, permanent DS failures, and category blacklist "
+            "are still excluded"
         )
         if force:
             console.print(
@@ -3226,13 +3398,14 @@ def enqueue_es(
                 "US/COM product_ids remain deduplicated[/yellow]"
             )
 
-        queue = None if dry_run else get_product_queue(settings)
+        queue = None if dry_run else (queue_for_failed or get_product_queue(settings))
         if queue is not None and reset_queue:
-            cleared = queue.clear(clear_seen=True)
+            cleared = queue.clear(clear_seen=True, clear_failed=False)
             console.print(
                 f"[yellow]Cleared queue[/yellow] "
                 f"queue_removed={cleared.get('queue_removed')} "
-                f"seen_removed={cleared.get('seen_removed')}"
+                f"seen_removed={cleared.get('seen_removed')} "
+                f"(failed set kept)"
             )
 
         batch: list[dict] = []
@@ -3288,6 +3461,8 @@ def enqueue_es(
                     current,
                     force=False,
                     use_seen=True,
+                    # Incremental refill: RPUSH so BRPOP takes new IDs first.
+                    priority=not reset_queue,
                 )
                 phase_counts[batch_phase] += new
             enqueued_total += new
@@ -3485,14 +3660,15 @@ def enqueue_es(
             console.print(f"  … {len(pending) - 10} more")
         return
 
-    q = get_product_queue(settings)
+    q = queue_for_failed or get_product_queue(settings)
     if reset_queue:
-        # Drop pending jobs + obsolete seen key; do not use seen for dedupe.
-        cleared = q.clear(clear_seen=True)
+        # Drop pending jobs + obsolete seen key; keep permanent failures.
+        cleared = q.clear(clear_seen=True, clear_failed=False)
         console.print(
             f"[yellow]Cleared queue[/yellow] "
             f"queue_removed={cleared.get('queue_removed')} "
-            f"seen_removed={cleared.get('seen_removed')}"
+            f"seen_removed={cleared.get('seen_removed')} "
+            f"(failed set kept)"
         )
     # Dedupe is already applied via ES products index (skip_existing).
     # Do not consult Redis seen — use_seen=False.
@@ -3840,6 +4016,14 @@ def queue_worker(
         es_buf = (
             EsProductBuffer(es, settings.es_products_index) if es is not None else None
         )
+        es_discard = (
+            EsDiscardBuffer(es, settings.es_urls_index) if es is not None else None
+        )
+        if es is not None:
+            try:
+                ensure_urls_discard_mapping(es, settings.es_urls_index)
+            except Exception as exc:
+                err_console.print(f"[yellow]discard mapping:[/yellow] {exc}")
         iop = IopClient(limiter=limiter, max_retries=settings.aliexpress_max_retries)
         service = ProductService(client=iop)
         stop = asyncio.Event()
@@ -3948,7 +4132,13 @@ def queue_worker(
                     async with out_lock:
                         with out_path.open("a", encoding="utf-8") as fh:
                             fh.write(line)
-                err_console.print(f"[red]{pid}[/red] {exc}")
+                exc_code = getattr(exc, "code", None)
+                error_class = classify_ds_error(str(exc), exc_code)
+                err_console.print(
+                    f"[red]{pid}[/red] "
+                    + (f"[{error_class}] " if error_class else "")
+                    + f"{exc}"
+                )
                 if _auth_fatal(str(exc)):
                     if requeue_on_rate_limit:
                         await q.requeue(job)
@@ -3956,6 +4146,22 @@ def queue_worker(
                         "[yellow]Stopping due to auth/sign error.[/yellow]"
                     )
                     stop.set()
+                elif error_class:
+                    await q.mark_failed(
+                        pid, error_class=error_class, error=str(exc)[:200]
+                    )
+                    if es_discard is not None:
+                        es_discard.add(
+                            {
+                                "product_id": pid,
+                                "source": source,
+                                "es_id": job.get("es_id"),
+                                "error_class": error_class,
+                                "error": str(exc)[:200],
+                            }
+                        )
+                elif is_transient_ds_error(str(exc), exc_code):
+                    await q.requeue(job)
 
         async def slot_worker(slot: int) -> None:
             nonlocal idle_rounds
@@ -4004,6 +4210,8 @@ def queue_worker(
             if es_buf is not None:
                 es_buf.close()
                 es_indexed = es_buf.indexed
+            if es_discard is not None:
+                es_discard.close()
             await iop.aclose()
             qlen_end = 0
             try:

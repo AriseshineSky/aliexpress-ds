@@ -78,6 +78,8 @@ class ProductQueue:
         self.client = _redis_client(url)
         self.queue_key = self.settings.redis_queue_key
         self.seen_key = self.settings.redis_queue_seen_key
+        self.failed_key = self.settings.redis_queue_failed_key
+        self.failed_class_key = self.settings.redis_queue_failed_class_key
         self.brpop_timeout = max(1, int(self.settings.redis_queue_brpop_timeout))
 
     def _reconnect(self) -> None:
@@ -106,11 +108,66 @@ class ProductQueue:
     def seen_count(self) -> int:
         return int(self.client.scard(self.seen_key))
 
+    def failed_count(self) -> int:
+        return int(self.client.scard(self.failed_key))
+
+    def failed_class_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        try:
+            values = self.client.hvals(self.failed_class_key) or []
+        except Exception:
+            return counts
+        for raw in values:
+            cls = str(raw or "").strip() or "unknown"
+            counts[cls] = counts.get(cls, 0) + 1
+        return counts
+
+    def load_failed_classes(self) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        try:
+            raw = self.client.hgetall(self.failed_class_key) or {}
+        except Exception:
+            return mapping
+        for pid, cls in raw.items():
+            key = str(pid or "").strip()
+            if key:
+                mapping[key] = str(cls or "").strip() or "unknown"
+        return mapping
+
     def is_seen(self, product_id: str) -> bool:
         return bool(self.client.sismember(self.seen_key, product_id))
 
     def mark_seen(self, product_id: str) -> None:
         self.client.sadd(self.seen_key, product_id)
+
+    def mark_failed(
+        self,
+        product_id: str,
+        *,
+        error_class: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        pid = str(product_id or "").strip()
+        if not pid:
+            return
+        self.client.sadd(self.failed_key, pid)
+        cls = str(error_class or "").strip()
+        if cls:
+            self.client.hset(self.failed_class_key, pid, cls)
+        _ = error
+
+    def load_failed_ids(self) -> set[str]:
+        ids: set[str] = set()
+        try:
+            iterator = self.client.sscan_iter(self.failed_key, count=5000)
+        except AttributeError:
+            members = self.client.smembers(self.failed_key) or []
+            iterator = members
+        for pid in iterator:
+            value = str(pid or "").strip()
+            if value:
+                ids.add(value)
+        return ids
 
     def enqueue(
         self,
@@ -140,14 +197,24 @@ class ProductQueue:
         self.client.lpush(self.queue_key, payload)
         return True
 
-    def clear(self, *, clear_seen: bool = True) -> dict[str, int]:
-        """Delete pending queue list and optionally the seen set. Returns sizes removed."""
+    def clear(
+        self, *, clear_seen: bool = True, clear_failed: bool = False
+    ) -> dict[str, int]:
+        """Delete pending queue list and optionally seen/failed sets."""
         qlen = int(self.client.llen(self.queue_key) or 0)
         seen = int(self.client.scard(self.seen_key) or 0)
+        failed = int(self.client.scard(self.failed_key) or 0)
         self.client.delete(self.queue_key)
         if clear_seen:
             self.client.delete(self.seen_key)
-        return {"queue_removed": qlen, "seen_removed": seen if clear_seen else 0}
+        if clear_failed:
+            self.client.delete(self.failed_key)
+            self.client.delete(self.failed_class_key)
+        return {
+            "queue_removed": qlen,
+            "seen_removed": seen if clear_seen else 0,
+            "failed_removed": failed if clear_failed else 0,
+        }
 
     def enqueue_many(
         self,
@@ -174,8 +241,26 @@ class ProductQueue:
         buf: list[tuple[str, str]] = []  # (pid, payload)
         push_cmd = "rpush" if priority else "lpush"
 
+        def _drop_failed(chunk: list[tuple[str, str]]) -> list[tuple[str, str]]:
+            nonlocal skipped
+            failed_key = getattr(self, "failed_key", "") or ""
+            if force or not failed_key or not chunk:
+                return chunk
+            pipe = self.client.pipeline(transaction=False)
+            for pid, _payload in chunk:
+                pipe.sismember(failed_key, pid)
+            flags = pipe.execute()
+            kept: list[tuple[str, str]] = []
+            for pair, flag in zip(chunk, flags, strict=True):
+                if int(flag or 0):
+                    skipped += 1
+                else:
+                    kept.append(pair)
+            return kept
+
         def _flush(chunk: list[tuple[str, str]]) -> None:
             nonlocal new, skipped
+            chunk = _drop_failed(chunk)
             if not chunk:
                 return
             pids = [pid for pid, _ in chunk]
@@ -344,6 +429,8 @@ class AsyncProductQueue:
         self.client = redis_async.from_url(url, **self._kwargs)
         self.queue_key = self.settings.redis_queue_key
         self.seen_key = self.settings.redis_queue_seen_key
+        self.failed_key = self.settings.redis_queue_failed_key
+        self.failed_class_key = self.settings.redis_queue_failed_class_key
         self.brpop_timeout = max(1, int(self.settings.redis_queue_brpop_timeout))
 
     async def _reconnect(self) -> None:
@@ -385,6 +472,33 @@ class AsyncProductQueue:
                 if not _is_redis_transient(exc):
                     raise
                 _log_redis_retry("BRPOP", exc, delay)
+                await self._reconnect()
+                await asyncio.sleep(delay)
+                delay = min(_REDIS_RETRY_MAX_DELAY, delay * 2)
+
+    async def mark_failed(
+        self,
+        product_id: str,
+        *,
+        error_class: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        pid = str(product_id or "").strip()
+        if not pid:
+            return
+        delay = 1.0
+        while True:
+            try:
+                await self.client.sadd(self.failed_key, pid)
+                cls = str(error_class or "").strip()
+                if cls:
+                    await self.client.hset(self.failed_class_key, pid, cls)
+                _ = error
+                return
+            except Exception as exc:
+                if not _is_redis_transient(exc):
+                    raise
+                _log_redis_retry("SADD failed", exc, delay)
                 await self._reconnect()
                 await asyncio.sleep(delay)
                 delay = min(_REDIS_RETRY_MAX_DELAY, delay * 2)

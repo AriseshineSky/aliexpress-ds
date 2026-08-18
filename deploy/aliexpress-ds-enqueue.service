@@ -11,10 +11,11 @@ WorkingDirectory=/home/Admin/aliexpress-ds
 Environment=HOME=/home/Admin
 Environment=PATH=/home/Admin/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Refill Redis queue from ES urls missing in products (blacklist from .env).
-# --reset-queue: rebuild reviews>90 DESC, unknown, then reviews<=90 DESC.
-# Dedupe: ES_PRODUCTS_INDEX plus Redis seen for duplicate US/COM URL documents.
+# Incremental: do NOT --reset-queue (that re-fed the same unsaleable prefix).
+# New IDs are RPUSHed so workers fetch them before the old backlog.
+# Permanent DS failures stay in Redis failed set and are skipped.
 # Safe to run on one VPS only (primary feeder).
-ExecStart=/home/Admin/.local/bin/uv run aliexpress-ds enqueue-es --reset-queue
+ExecStart=/home/Admin/.local/bin/uv run aliexpress-ds enqueue-es --no-reset-queue
 TimeoutStartSec=3600
 Nice=10
 

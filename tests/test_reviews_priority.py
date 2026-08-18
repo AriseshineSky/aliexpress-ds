@@ -20,7 +20,12 @@ def test_reviews_priority_phases_are_disjoint_and_ordered() -> None:
     assert high_range == {"gt": 90, "lte": 5_000_000}
     assert low_range == {"gte": 0, "lte": 90}
     assert phases[0][2][0]["reviews"]["order"] == "desc"
-    assert phases[2][2][0]["reviews"]["order"] == "desc"
+    assert phases[1][2][0]["created_at"]["order"] == "desc"
+    assert phases[2][2][0]["created_at"]["order"] == "desc"
+    for _name, query, _sort in phases:
+        assert {"term": {"ds_discard": True}} in query["bool"]["must_not"]
+    for _name, query, _sort in phases:
+        assert {"term": {"ds_discard": True}} in query["bool"]["must_not"]
 
 
 class _FakeEs:
@@ -73,4 +78,5 @@ def test_iter_urls_streams_high_unknown_low_and_skips_existing() -> None:
         ("reviews_low", "5"),
     ]
     assert es.search_calls[0]["sort"][0]["reviews"]["order"] == "desc"
-    assert es.search_calls[2]["sort"][0]["reviews"]["order"] == "desc"
+    assert es.search_calls[1]["sort"][0]["created_at"]["order"] == "desc"
+    assert es.search_calls[2]["sort"][0]["created_at"]["order"] == "desc"

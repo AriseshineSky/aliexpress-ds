@@ -121,9 +121,14 @@ REDIS_QUEUE_SEEN_KEY=aliexpress-ds:products:seen
 ```
 
 ```bash
-# 1) 每 2h 清空 Redis 队列，按 reviews>90 DESC → 缺失 → reviews≤90 DESC 重建
-#    已抓详情由 ES_PRODUCTS_INDEX 排除；Redis seen 去重 US/COM 重复 ID
-#    （systemd: aliexpress-ds-enqueue.timer → enqueue-es --reset-queue）
+# 1) 每 2h 增量补队（不要 --reset-queue：会反复把同一批 unsaleable 旧 ID 排到队头）
+#    已抓详情由 ES_PRODUCTS_INDEX 排除；永久失败打 ds_discard（unsaleable/not_found/…）
+#    uv run aliexpress-ds sync-discard                 # Redis failed → ES urls
+#    uv run aliexpress-ds sync-discard --from-jsonl data/ds_queue_products.jsonl
+#    reviews>90 → 缺失/低评按 created_at DESC（新 URL 优先）
+#    （systemd: aliexpress-ds-enqueue.timer → enqueue-es --no-reset-queue）
+uv run aliexpress-ds enqueue-es --no-reset-queue
+# 仅在策略变更时全量重建（保留 failed set）
 uv run aliexpress-ds enqueue-es --reset-queue
 uv run aliexpress-ds enqueue-es --reset-queue -n 500
 uv run aliexpress-ds enqueue-es --dry-run

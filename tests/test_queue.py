@@ -10,6 +10,10 @@ class _Pipeline:
         self.ops.append(("sadd", key, value))
         return self
 
+    def sismember(self, key, value):
+        self.ops.append(("sismember", key, value))
+        return self
+
     def lpush(self, key, value):
         self.ops.append(("lpush", key, value))
         return self
@@ -26,6 +30,8 @@ class _Pipeline:
                 added = value not in values
                 values.add(value)
                 results.append(1 if added else 0)
+            elif command == "sismember":
+                results.append(1 if value in self.client.sets.get(key, set()) else 0)
             elif command == "lpush":
                 self.client.lists.setdefault(key, []).insert(0, value)
                 results.append(1)
@@ -50,6 +56,7 @@ def test_enqueue_many_counts_new_items_when_seen_dedup_is_enabled() -> None:
     queue.client = _Redis()
     queue.queue_key = "queue"
     queue.seen_key = "seen"
+    queue.failed_key = "failed"
 
     new, skipped = queue.enqueue_many(
         [
@@ -62,3 +69,25 @@ def test_enqueue_many_counts_new_items_when_seen_dedup_is_enabled() -> None:
 
     assert (new, skipped) == (2, 1)
     assert len(queue.client.lists["queue"]) == 2
+
+
+def test_enqueue_many_skips_permanent_failures() -> None:
+    queue = object.__new__(ProductQueue)
+    queue.client = _Redis()
+    queue.queue_key = "queue"
+    queue.seen_key = "seen"
+    queue.failed_key = "failed"
+    queue.client.sets["failed"] = {"bad"}
+
+    new, skipped = queue.enqueue_many(
+        [
+            {"product_id": "bad"},
+            {"product_id": "ok"},
+        ],
+        use_seen=True,
+    )
+
+    assert (new, skipped) == (1, 1)
+    payloads = queue.client.lists["queue"]
+    assert len(payloads) == 1
+    assert "ok" in payloads[0]
