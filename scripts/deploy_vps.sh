@@ -109,8 +109,9 @@ if [[ -z "$INSTALL_ENQUEUE_TIMER" ]]; then
   fi
 fi
 INSTALL_BESTSELLERS_TIMER="${INSTALL_BESTSELLERS_TIMER:-$INSTALL_ENQUEUE_TIMER}"
+INSTALL_DISCOVER_TIMER="${INSTALL_DISCOVER_TIMER:-$INSTALL_ENQUEUE_TIMER}"
 
-echo "==> install systemd units (needs sudo; enqueue_timer=$INSTALL_ENQUEUE_TIMER bestsellers_timer=$INSTALL_BESTSELLERS_TIMER)"
+echo "==> install systemd units (needs sudo; enqueue_timer=$INSTALL_ENQUEUE_TIMER bestsellers_timer=$INSTALL_BESTSELLERS_TIMER discover_timer=$INSTALL_DISCOVER_TIMER)"
 "${SSH[@]}" "$HOST" bash -s <<EOF
 set -euo pipefail
 sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-queue-worker.service" /etc/systemd/system/
@@ -120,6 +121,9 @@ sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-enqueue.service" /etc/systemd/system/
 sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-enqueue.timer" /etc/systemd/system/
 sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-bestsellers.service" /etc/systemd/system/
 sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-bestsellers.timer" /etc/systemd/system/
+sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-discover.service" /etc/systemd/system/
+sudo cp "$REMOTE_DIR/deploy/aliexpress-ds-discover.timer" /etc/systemd/system/
+sudo chmod +x "$REMOTE_DIR/scripts/discover_categories.sh"
 sudo systemctl daemon-reload
 sudo systemctl enable --now aliexpress-ds-token-refresh.timer
 sudo systemctl enable --now aliexpress-ds-queue-worker.service
@@ -133,6 +137,11 @@ if [[ "$INSTALL_BESTSELLERS_TIMER" == "1" ]]; then
   sudo systemctl enable --now aliexpress-ds-bestsellers.timer
 else
   sudo systemctl disable --now aliexpress-ds-bestsellers.timer 2>/dev/null || true
+fi
+if [[ "$INSTALL_DISCOVER_TIMER" == "1" ]]; then
+  sudo systemctl enable --now aliexpress-ds-discover.timer
+else
+  sudo systemctl disable --now aliexpress-ds-discover.timer 2>/dev/null || true
 fi
 sudo systemctl status aliexpress-ds-queue-worker.service --no-pager -l | head -40
 sudo systemctl list-timers 'aliexpress-ds*' --no-pager

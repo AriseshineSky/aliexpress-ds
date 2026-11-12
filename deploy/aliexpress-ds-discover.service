@@ -1,0 +1,22 @@
+[Unit]
+Description=AliExpress DS daily URL discovery (10 categories → ES urls index)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=Admin
+Group=Admin
+WorkingDirectory=/home/Admin/aliexpress-ds
+Environment=HOME=/home/Admin
+Environment=PATH=/home/Admin/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash /home/Admin/aliexpress-ds/scripts/discover_categories.sh
+TimeoutStartSec=7200
+Nice=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aliexpress-ds-discover
+
+NoNewPrivileges=true
+PrivateTmp=true

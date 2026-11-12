@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily AliExpress DS URL discovery (10 categories)
+
+[Timer]
+# Once a day, off-peak relative to the hourly enqueue timer.
+# Timer uses the VPS local timezone (mongo = America/Chicago).
+OnCalendar=*-*-* 04:10:00
+Persistent=true
+AccuracySec=5min
+Unit=aliexpress-ds-discover.service
+
+[Install]
+WantedBy=timers.target

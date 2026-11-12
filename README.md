@@ -242,15 +242,23 @@ systemd：
 |------|------|
 | `aliexpress-ds-queue-worker.service` | 常驻监听 Redis 队列 |
 | `aliexpress-ds-token-refresh.timer` | 每小时确保 token 新鲜 |
-| `aliexpress-ds-enqueue.timer` | 每 2 小时 **清空并重建** Redis 队列（质量门优先 + reviews DESC；默认只装在 mongo VPS） |
+| `aliexpress-ds-enqueue.timer` | 每 2 小时从 urls 索引补队（**不**清空；只补 products 索引里没有的 id；默认只装在 mongo VPS） |
 | `aliexpress-ds-bestsellers.timer` | **每天**同步 bestsellers → 标记 → 缺详情优先入队 → 分布报告 |
+| `aliexpress-ds-discover.timer` | **每天 04:10** 跑 `scripts/discover_categories.sh`：用官方 `aliexpress.ds.text.search` 给选定的 10 个类目补 URL 进 urls 索引（无浏览器/无验证码；默认只装在 mongo VPS） |
+
+> URL 发现是整条流水线的前置：`link-crawler`（浏览器）与 `discover-search` 都停过，队列会在几天内吃完。
+> 先看 `data/discover/discover_<日期>.log` 与 `discover-search` 的 `es_indexed`；为 0 说明该 AppKey 没额度或类目 id 需要更新
+>（`uv run aliexpress-ds categories | head` 可看 DS 类目树 id，注意它和 aliexpress.us 网页类目名不一致）。
 
 ```bash
 sudo systemctl status aliexpress-ds-queue-worker
 sudo journalctl -u aliexpress-ds-queue-worker -f
 sudo journalctl -u aliexpress-ds-enqueue -n 50
 sudo journalctl -u aliexpress-ds-bestsellers -n 100
+sudo journalctl -u aliexpress-ds-discover -n 100
 sudo systemctl list-timers 'aliexpress-ds*'
+# 手动跑一轮类目 URL 发现（先小预算验证）
+cd /home/Admin/aliexpress-ds && DISCOVER_MAX_KEYWORDS=3 DISCOVER_PAGES=1 ./scripts/discover_categories.sh
 # 手动跑一天任务（先 dry-run）
 cd /home/Admin/aliexpress-ds && uv run aliexpress-ds bestsellers-daily --dry-run
 uv run aliexpress-ds bestsellers-daily

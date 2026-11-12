@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -339,7 +339,9 @@ def to_standard_product(
     logistics = result.get("logistics_info_dto") or {}
     shipping_days = _to_int(logistics.get("delivery_time"))
 
-    now = datetime.now().replace(microsecond=0).isoformat()
+    # UTC, not naive local: ES/Lucene date math treats the value as UTC, so a
+    # naive datetime.now() on a CST host made every product look 6h stale.
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     src = source or source_from_url(url)
 
     payload: dict[str, Any] = {
