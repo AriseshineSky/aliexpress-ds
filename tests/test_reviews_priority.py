@@ -1,7 +1,63 @@
 from aliexpress_ds.es import (
+    category_roots_clause,
     iter_urls_by_reviews_priority,
+    restrict_to_categories,
     urls_reviews_priority_phases,
 )
+
+
+def test_category_roots_clause_matches_substrings_case_insensitive() -> None:
+    clause = category_roots_clause(["Automotive", " Pet Supplies ", ""])
+
+    assert clause is not None
+    wildcards = [
+        entry["wildcard"]["category"] for entry in clause["bool"]["should"]
+    ]
+    assert wildcards == [
+        {"value": "*Automotive*", "case_insensitive": True},
+        {"value": "*Pet Supplies*", "case_insensitive": True},
+    ]
+    assert clause["bool"]["minimum_should_match"] == 1
+    assert category_roots_clause([]) is None
+    assert category_roots_clause(None) is None
+
+
+def test_category_wildcard_escapes_special_characters() -> None:
+    clause = category_roots_clause(["A*B?C", "back\\slash"])
+
+    assert clause is not None
+    values = [entry["wildcard"]["category"]["value"] for entry in clause["bool"]["should"]]
+    assert values == ["*A\\*B\\?C*", "*back\\\\slash*"]
+
+
+def test_restrict_to_categories_ands_into_bool_filter() -> None:
+    query = {"bool": {"filter": [{"exists": {"field": "product_id"}}]}}
+
+    restricted = restrict_to_categories(query, ["Automotive"])
+
+    filters = restricted["bool"]["filter"]
+    assert filters[0] == {"exists": {"field": "product_id"}}
+    assert filters[1]["bool"]["should"][0]["wildcard"]["category"]["value"] == (
+        "*Automotive*"
+    )
+    assert restrict_to_categories(query, []) == query
+    assert restrict_to_categories(query, None) == query
+
+
+def test_priority_phases_carry_category_filter() -> None:
+    phases = urls_reviews_priority_phases(category_roots=["Automotive"])
+
+    for _name, query, _sort in phases:
+        clauses = [
+            clause
+            for clause in query["bool"]["filter"]
+            if "should" in clause.get("bool", {})
+        ]
+        assert any(
+            wildcard["wildcard"]["category"]["value"] == "*Automotive*"
+            for clause in clauses
+            for wildcard in clause["bool"]["should"]
+        )
 
 
 def test_reviews_priority_phases_are_disjoint_and_ordered() -> None:

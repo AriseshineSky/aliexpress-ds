@@ -74,6 +74,9 @@ def _auth_fatal(message: str) -> bool:
         "incomplete signature",
         "invalid signature",
         "access token",
+        "access_token",
+        "no token in redis",
+        "redis token unavailable",
         "sessionkey",
         "session key",
         "missing credentials",
@@ -3242,6 +3245,24 @@ def enqueue_es(
         "--category-blacklist/--no-category-blacklist",
         help="Skip clothing/adult categories (default: ENQUEUE_CATEGORY_BLACKLIST)",
     ),
+    categories: list[str] = typer.Option(
+        [],
+        "--categories",
+        "-C",
+        help=(
+            "Repeatable one-off category filter: each value is matched as a "
+            "case-insensitive substring against the urls-index `category` path, "
+            "e.g. -C Automotive -C 'Pet Supplies'."
+        ),
+    ),
+    no_seen: bool = typer.Option(
+        False,
+        "--no-seen",
+        help=(
+            "Ignore the Redis seen set (required to re-fetch already-collected "
+            "products). Duplicates inside one run are still deduped."
+        ),
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -3317,6 +3338,8 @@ def enqueue_es(
     q_min_sold = (
         settings.enqueue_min_sold_count if min_sold_count is None else min_sold_count
     )
+    category_roots = [root.strip() for root in categories if root.strip()]
+    use_seen = not no_seen
 
     def _apply_blacklist(items: list[dict], label: str) -> list[dict]:
         if not use_category_blacklist:
@@ -3364,6 +3387,16 @@ def enqueue_es(
         return items
 
     console.print("Connecting ES …")
+    if category_roots:
+        console.print(
+            f"Category filter ON: {', '.join(category_roots)} "
+            "(urls-index category substring, case-insensitive)"
+        )
+    if not use_seen:
+        console.print(
+            "[yellow]Redis seen set bypassed[/yellow] (--no-seen): "
+            "already-collected product_ids can be re-queued"
+        )
     es = make_es_client(settings)
     existing: set[str] = set()
     if skip_existing_products:
@@ -3410,6 +3443,7 @@ def enqueue_es(
 
         batch: list[dict] = []
         batch_phase = ""
+        local_seen: set[str] = set()
         phase_counts = {
             "reviews_high": 0,
             "reviews_unknown": 0,
@@ -3437,6 +3471,18 @@ def enqueue_es(
                     ),
                 )
                 blocked_total += blocked
+            if not use_seen:
+                deduped: list[dict] = []
+                for item in current:
+                    pid = str(item.get("product_id") or "")
+                    if not pid:
+                        continue
+                    if pid in local_seen:
+                        skipped_total += 1
+                        continue
+                    local_seen.add(pid)
+                    deduped.append(item)
+                current = deduped
             if limit and limit > 0:
                 remaining = max(0, int(limit) - enqueued_total)
                 current = current[:remaining]
@@ -3460,7 +3506,7 @@ def enqueue_es(
                 new, skipped = queue.enqueue_many(
                     current,
                     force=False,
-                    use_seen=True,
+                    use_seen=use_seen,
                     # Incremental refill: RPUSH so BRPOP takes new IDs first.
                     priority=not reset_queue,
                 )
@@ -3474,6 +3520,7 @@ def enqueue_es(
             existing_ids=existing if skip_existing_products else set(),
             threshold=q_reviews_threshold,
             max_valid_reviews=settings.enqueue_reviews_max_valid,
+            category_roots=category_roots,
         ):
             if limit and limit > 0 and enqueued_total >= int(limit):
                 break
@@ -3560,10 +3607,11 @@ def enqueue_es(
                 min_rating=q_min_rating,
                 min_reviews=q_min_reviews,
                 min_sold_count=q_min_sold,
+                category_roots=category_roots,
             )
         )
     else:
-        from aliexpress_ds.es import urls_quality_query
+        from aliexpress_ds.es import restrict_to_categories, urls_quality_query
 
         pending = []
         query = (
@@ -3576,6 +3624,7 @@ def enqueue_es(
             if use_quality
             else None
         )
+        query = restrict_to_categories(query or {"match_all": {}}, category_roots)
         for doc in scroll_sources(
             es,
             settings.es_urls_index,
@@ -3634,6 +3683,7 @@ def enqueue_es(
                 quality_filter=False,
                 missing_fields_only=False,
                 exclude_ids=quality_ids,
+                category_roots=category_roots,
             )
         )
         rest_pending = _apply_blacklist(rest_pending, "rest")
@@ -3985,6 +4035,11 @@ def queue_worker(
         settings.require_queue_redis()
         if index_es:
             settings.require_es()
+        # Fail fast when the OAuth token is missing/expired. Without this the
+        # worker pops jobs, fails per job, and silently drains the whole queue.
+        from aliexpress_ds.token_store import resolve_access_token
+
+        resolve_access_token(settings)
     except ValueError as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -4162,6 +4217,20 @@ def queue_worker(
                         )
                 elif is_transient_ds_error(str(exc), exc_code):
                     await q.requeue(job)
+                else:
+                    # Unknown error: never drop silently — retry a few times,
+                    # then stamp it as a permanent unknown failure.
+                    attempts = int(job.get("attempts") or 0) + 1
+                    if attempts <= 3:
+                        await q.requeue({**job, "attempts": attempts})
+                        err_console.print(
+                            f"[yellow]requeued {pid} "
+                            f"(unknown error, attempt {attempts}/3)[/yellow]"
+                        )
+                    else:
+                        await q.mark_failed(
+                            pid, error_class="unknown", error=str(exc)[:200]
+                        )
 
         async def slot_worker(slot: int) -> None:
             nonlocal idle_rounds

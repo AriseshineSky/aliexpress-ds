@@ -168,13 +168,47 @@ uv run aliexpress-ds queue-worker
 uv run aliexpress-ds enqueue-es --no-category-blacklist   # 临时关闭
 ```
 
+### 一次性按类目补队 / 重刷（不传小时定时器）
+
+小时定时器（mongo）跑的是默认逻辑（只补 products 索引里没有的 id）。想只针对某几个类目
+**重刷详情/价格**（这些 id 早已在 products 索引里）时，用下面三个开关组合，一次性手动跑：
+
+| 开关 | 作用 |
+|------|------|
+| `--categories/-C <root>`（可重复） | 只选 urls 索引 `category` 路径包含该子串的文档（大小写不敏感，`US / …` 与 `COM / …` 同时命中） |
+| `--include-existing` | 绕过 products 索引去重（否则老 id 全被跳过） |
+| `--no-seen` | 绕过 Redis seen 集合（否则已抓过的 id 全被跳过）；同一轮内仍按 product_id 去重 |
+
+```bash
+# 先 dry-run 看数量（十几分钟，纯读 ES）
+uv run aliexpress-ds enqueue-es \
+  -C "Automotive" -C "Tools & Home Improvement" -C "Sports & Outdoors" \
+  --include-existing --no-seen --dry-run
+
+# 确认后真灌（RPUSH，消费者 BRPOP 先取新队头）
+uv run aliexpress-ds enqueue-es \
+  -C "Automotive" -C "Tools & Home Improvement" -C "Sports & Outdoors" \
+  --include-existing --no-seen
+```
+
+`ds_discard=true`（unsaleable / not_found / ship_prohibited）和 Redis failed 集合永久失败
+的 id 仍会被跳过，不会重复重试。
+
 ### 授权与自动刷新 Token
 
 1. **首次授权**（浏览器，一年内需在 refresh 过期前重做）：  
    https://aliexpress-oauth.onrender.com/oauth/authorize  
    成功后 token 写入 Upstash `REDIS_URL` 的 key `aliexpress:oauth:token`。
-2. **本项目自动读/刷新**：每次 API 调用前若 `access_token` 将在 **1 小时内**过期，会调 `/auth/token/refresh` 并写回同一 Redis。
-3. **手动**：`uv run aliexpress-ds refresh-token`（`--force` 强制刷新）。
+2. **多 AppKey**：token 按 `aliexpress:oauth:token:<app_key>` 存，每个 VPS 读自己 `.env` 里
+   `ALIEXPRESS_APP_KEY` 对应的 key（主 App 同时写 legacy `aliexpress:oauth:token`）。
+3. **本项目自动读/刷新**：每次 API 调用前若 `access_token` 将在 **1 小时内**过期，会调 `/auth/token/refresh` 并写回同一 Redis。
+4. **手动**：`uv run aliexpress-ds refresh-token`（`--force` 强制刷新）。
+
+> **token 缺失时 queue-worker 会启动即失败并退出**（systemd `Restart=always` 每 15s 重试），
+> 不会 POP 任务。以前的行为是逐个 POP→报错→丢弃，会把整条队列悄悄抽干。
+> 排查：`sudo journalctl -u aliexpress-ds-queue-worker -n 20` 看到
+> `No access_token` 说明 Upstash 里没有该 app_key 的 token，重新授权后再
+> `sudo systemctl start aliexpress-ds-queue-worker`。
 
 ### 部署到 VPS（Admin@34.172.204.102 / mongo）
 

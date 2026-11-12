@@ -88,6 +88,57 @@ def exclude_discarded(query: dict[str, Any] | None = None) -> dict[str, Any]:
     return {"bool": {"must": [query], "must_not": [clause]}}
 
 
+def _escape_wildcard(text: str) -> str:
+    """Escape user text so it is matched literally inside an ES wildcard."""
+    escaped = text.replace("\\", "\\\\")
+    for char in ("*", "?"):
+        escaped = escaped.replace(char, f"\\{char}")
+    return escaped
+
+
+def category_roots_clause(category_roots: list[str] | None) -> dict[str, Any] | None:
+    """Case-insensitive wildcard OR clause over urls-index ``category`` paths.
+
+    Roots are literal substrings (e.g. ``"Tools & Home Improvement"``) so one
+    root matches both ``US / ...`` and ``COM / ...`` category paths.
+    """
+    roots = [str(root).strip() for root in (category_roots or []) if str(root).strip()]
+    if not roots:
+        return None
+    return {
+        "bool": {
+            "should": [
+                {
+                    "wildcard": {
+                        "category": {
+                            "value": f"*{_escape_wildcard(root)}*",
+                            "case_insensitive": True,
+                        }
+                    }
+                }
+                for root in roots
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+
+
+def restrict_to_categories(
+    query: dict[str, Any],
+    category_roots: list[str] | None,
+) -> dict[str, Any]:
+    """AND a category-root filter into an existing bool query."""
+    clause = category_roots_clause(category_roots)
+    if clause is None:
+        return query
+    bool_q = query.get("bool")
+    if isinstance(bool_q, dict):
+        inner = dict(bool_q)
+        inner["filter"] = [*(inner.get("filter") or []), clause]
+        return {**query, "bool": inner}
+    return {"bool": {"filter": [query, clause]}}
+
+
 def urls_quality_query(
     *,
     max_price: float | None = None,
@@ -140,6 +191,7 @@ def urls_reviews_priority_phases(
     *,
     threshold: int = 90,
     max_valid_reviews: int = 5_000_000,
+    category_roots: list[str] | None = None,
 ) -> list[tuple[str, dict[str, Any], list[dict[str, Any]]]]:
     """ES queries for high reviews, unknown reviews, then low reviews.
 
@@ -171,7 +223,7 @@ def urls_reviews_priority_phases(
         },
         {"product_id": {"order": "asc"}},
     ]
-    return [
+    phases = [
         (
             "reviews_high",
             exclude_discarded(
@@ -232,6 +284,12 @@ def urls_reviews_priority_phases(
             created_at_desc,
         ),
     ]
+    if category_roots:
+        phases = [
+            (name, restrict_to_categories(query, category_roots), sort)
+            for name, query, sort in phases
+        ]
+    return phases
 
 
 def iter_urls_by_reviews_priority(
@@ -241,6 +299,7 @@ def iter_urls_by_reviews_priority(
     existing_ids: set[str] | None = None,
     threshold: int = 90,
     max_valid_reviews: int = 5_000_000,
+    category_roots: list[str] | None = None,
     page_size: int = 2000,
 ) -> Iterator[tuple[str, dict[str, Any]]]:
     """Stream pending URL docs in review-priority order without materializing all."""
@@ -260,6 +319,7 @@ def iter_urls_by_reviews_priority(
     for phase, query, sort in urls_reviews_priority_phases(
         threshold=threshold,
         max_valid_reviews=max_valid_reviews,
+        category_roots=category_roots,
     ):
         for doc in scroll_sources(
             es,
@@ -321,6 +381,7 @@ def list_missing_urls(
     quality_filter: bool = False,
     missing_fields_only: bool = False,
     exclude_ids: set[str] | None = None,
+    category_roots: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Load pending URLs into memory so scroll finishes before slow API calls.
 
@@ -349,6 +410,7 @@ def list_missing_urls(
         )
     else:
         query = exclude_discarded()
+    query = restrict_to_categories(query, category_roots)
     missing: list[dict[str, Any]] = []
     for doc in scroll_sources(
         es,
@@ -401,6 +463,7 @@ def iter_missing_urls(
     quality_filter: bool = False,
     missing_fields_only: bool = False,
     exclude_ids: set[str] | None = None,
+    category_roots: list[str] | None = None,
 ) -> Iterator[dict[str, Any]]:
     yield from list_missing_urls(
         es,
@@ -414,6 +477,7 @@ def iter_missing_urls(
         quality_filter=quality_filter,
         missing_fields_only=missing_fields_only,
         exclude_ids=exclude_ids,
+        category_roots=category_roots,
     )
 
 
